@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""
+Consigli del giorno - 5 top campionati europei + nazionali
+----------------------------------------------------------
+Per ogni partita ti dice COSA giocare (es. "Genoa-Parma: Under 3.5") e la
+QUOTA MINIMA sotto cui non conviene. Nessuna chiave API, nessun login.
+Solo libreria standard (Pyto, Pythonista, a-Shell, GitHub Actions).
+
+Fonti:
+  Club:      football-data.co.uk (storico + calendario con quote)
+  Nazionali: calendario da ESPN (endpoint pubblico non ufficiale), poi dataset
+             github.com/martj42/international_results, poi lista manuale.
+
+Uso:
+  python value_bet.py              # partite di oggi
+  python value_bet.py --days 3     # prossimi 3 giorni
+  python value_bet.py --no-intl    # salta le nazionali
+  python value_bet.py --no-club    # salta i club
+
+Notifica opzionale: variabile d'ambiente NTFY_TOPIC (ntfy.sh).
+"""
+import argparse
+import csv
+import difflib
+import io
+import json
+import math
+import os
+import urllib.request
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+
+# ----------------------------- CONFIG ---------------------------------
+LEAGUES = {
+    "E0": "Premier League",
+    "SP1": "La Liga",
+    "D1": "Bundesliga",
+    "I1": "Serie A",
+    "F1": "Ligue 1",
+}
+FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
+HISTORY_URL = "https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
+INTL_URL = ("https://raw.githubusercontent.com/martj42/international_results/"
+            "master/results.csv")
+ESPN_URL = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+            "{slug}/scoreboard?dates={d}")
+# (slug ESPN, etichetta). Gli slug sbagliati o non disponibili vengono ignorati.
+ESPN_INTL = [
+    ("uefa.nations", "Nations League"),
+    ("fifa.friendly", "Amichevole"),
+    ("uefa.euroq", "Qualificazioni Euro"),
+    ("fifa.worldq.uefa", "Qualificazioni Mondiali UEFA"),
+    ("fifa.worldq.conmebol", "Qualificazioni Mondiali CONMEBOL"),
+    ("fifa.worldq.concacaf", "Qualificazioni Mondiali CONCACAF"),
+    ("fifa.worldq.caf", "Qualificazioni Mondiali CAF"),
+    ("fifa.worldq.afc", "Qualificazioni Mondiali AFC"),
+    ("concacaf.nations.league", "Nations League CONCACAF"),
+]
+
+HALF_LIFE_CLUB = 240     # giorni: il peso di una partita si dimezza ogni 240 gg
+HALF_LIFE_INTL = 365
+INTL_YEARS = 4
+SHRINK_CLUB = 4.0        # "partite fittizie" che avvicinano alla media
+SHRINK_INTL = 3.0
+MIN_W_CLUB = 4.0         # dati minimi (pesati) per fidarsi di una squadra
+MIN_W_INTL = 2.0
+DC_RHO = -0.10           # correzione Dixon-Coles per i punteggi bassi
+
+MIN_PROB = 0.60          # sotto questa probabilita' non consiglio nulla
+MAX_SAFE_PROB = 0.86     # sopra questa la quota sarebbe < ~1.16 (inutile)
+BOLD_MIN_PROB = 0.55     # per l'alternativa "piu' quota"
+MARGIN = 1.05            # quota minima = MARGIN / probabilita'
+
+# Lista di riserva per le nazionali (usata solo se le altre fonti falliscono).
+# (casa, ospite, campo_neutro, competizione). Nomi come nel dataset martj42.
+MANUAL_DATE = date(2026, 11, 17)
+MANUAL_FIXTURES = [
+    ("Denmark", "Norway", False, "Nations League"),
+    ("Wales", "Portugal", False, "Nations League"),
+    ("Bosnia and Herzegovina", "Romania", False, "Nations League"),
+    ("Republic of Ireland", "Kosovo", False, "Nations League"),
+    ("Israel", "Austria", True, "Nations League"),
+    ("Poland", "Sweden", False, "Nations League"),
+    ("Ukraine", "Georgia", True, "Nations League"),
+    ("Hungary", "Northern Ireland", False, "Nations League"),
+]
+
+NAME_ALIASES = {
+    "Bosnia-Herzegovina": "Bosnia and Herzegovina",
+    "Bosnia & Herzegovina": "Bosnia and Herzegovina",
+    "Ireland": "Republic of Ireland",
+    "Czechia": "Czech Republic",
+    "Turkiye": "Turkey",
+    "Türkiye": "Turkey",
+    "USA": "United States",
+    "Korea Republic": "South Korea",
+    "Cape Verde Islands": "Cape Verde",
+    "Cote d'Ivoire": "Ivory Coast",
+    "Côte d'Ivoire": "Ivory Coast",
+}
+
+BOOK_PREFIXES = ["B365", "BW", "IW", "PS", "P", "WH", "VC", "Max"]
+BOOK_NAMES = {"B365": "Bet365", "BW": "Betway", "IW": "Interwetten",
+              "PS": "Pinnacle", "P": "Pinnacle", "WH": "William Hill",
+              "VC": "VC Bet", "Max": "miglior quota"}
+
+# chiave -> descrizione
+MARKET_LABELS = {
+    "1": "1 (vince la casa)", "X": "X (pareggio)", "2": "2 (vince l'ospite)",
+    "1X": "1X (casa o pareggio)", "X2": "X2 (ospite o pareggio)",
+    "12": "12 (no pareggio)",
+    "U1.5": "Under 1.5 gol", "O1.5": "Over 1.5 gol",
+    "U2.5": "Under 2.5 gol", "O2.5": "Over 2.5 gol",
+    "U3.5": "Under 3.5 gol", "O3.5": "Over 3.5 gol",
+    "GG": "Gol (segnano entrambe)", "NG": "No Gol (almeno una a secco)",
+}
+# colonne quote football-data per i mercati che ci sono nel CSV
+ODDS_COLUMNS = {"1": "H", "X": "D", "2": "A", "O2.5": ">2.5", "U2.5": "<2.5"}
+
+
+# ----------------------------- UTILITA' --------------------------------
+def download(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return r.read().decode("utf-8-sig", errors="replace")
+
+
+def read_csv(text):
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+def parse_date(s):
+    s = (s or "").strip()
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def season_codes(today):
+    start = today.year if today.month >= 7 else today.year - 1
+    return ["%02d%02d" % ((start - i) % 100, (start - i + 1) % 100)
+            for i in range(2)]
+
+
+def best_odds(row, suffix):
+    best, src = None, None
+    for p in BOOK_PREFIXES:
+        try:
+            v = float(row.get(p + suffix))
+        except (TypeError, ValueError):
+            continue
+        if v > 1.0 and (best is None or v > best):
+            best, src = v, p
+    return best, BOOK_NAMES.get(src, src)
+
+
+def resolve_name(name, known):
+    if name in known:
+        return name
+    alt = NAME_ALIASES.get(name)
+    if alt and alt in known:
+        return alt
+    close = difflib.get_close_matches(name, list(known), n=1, cutoff=0.78)
+    return close[0] if close else None
+
+
+# ----------------------------- MODELLO ---------------------------------
+def fit_poisson(matches, k, iters=25):
+    """matches: (casa, ospite, gol_casa, gol_ospite, peso, neutro).
+    Stima attacco/difesa corretti per la forza degli avversari."""
+    tw = sum(m[4] for m in matches)
+    if tw <= 0:
+        return None
+    mu = max(sum(m[4] * (m[2] + m[3]) for m in matches) / (2 * tw), 0.3)
+
+    hg_tot = sum(m[4] * m[2] for m in matches if not m[5])
+    ag_tot = sum(m[4] * m[3] for m in matches if not m[5])
+    ha = math.sqrt(hg_tot / ag_tot) if hg_tot > 0 and ag_tot > 0 else 1.0
+
+    att = defaultdict(lambda: 1.0)
+    dfn = defaultdict(lambda: 1.0)
+    team_w = defaultdict(float)
+    for h, a, _, _, w, _ in matches:
+        team_w[h] += w
+        team_w[a] += w
+
+    for _ in range(iters):
+        na, da = defaultdict(float), defaultdict(float)
+        nd, dd = defaultdict(float), defaultdict(float)
+        for h, a, hg, ag, w, neu in matches:
+            fh = 1.0 if neu else ha
+            fa = 1.0 if neu else 1.0 / ha
+            na[h] += w * hg
+            da[h] += w * mu * dfn[a] * fh
+            na[a] += w * ag
+            da[a] += w * mu * dfn[h] * fa
+            nd[h] += w * ag
+            dd[h] += w * mu * att[a] * fa
+            nd[a] += w * hg
+            dd[a] += w * mu * att[h] * fh
+        for t in team_w:
+            att[t] = (na[t] + k * mu) / (da[t] + k * mu)
+            dfn[t] = (nd[t] + k * mu) / (dd[t] + k * mu)
+
+    return {"mu": mu, "ha": ha, "att": dict(att), "dfn": dict(dfn),
+            "team_w": dict(team_w)}
+
+
+def expected_goals(model, home, away, neutral, min_w):
+    tw = model["team_w"]
+    if tw.get(home, 0) < min_w or tw.get(away, 0) < min_w:
+        return None
+    mu, ha = model["mu"], model["ha"]
+    fh = 1.0 if neutral else ha
+    fa = 1.0 if neutral else 1.0 / ha
+    lh = mu * model["att"][home] * model["dfn"][away] * fh
+    la = mu * model["att"][away] * model["dfn"][home] * fa
+    return lh, la
+
+
+def poisson_pmf(k, lam):
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def tau(i, j, lh, la, rho):
+    """Correzione Dixon-Coles: i punteggi bassi (0-0, 1-0, 0-1, 1-1) non
+    sono indipendenti. Importante per Under 1.5 / 2.5 e pareggi."""
+    if i == 0 and j == 0:
+        return 1 - lh * la * rho
+    if i == 0 and j == 1:
+        return 1 + lh * rho
+    if i == 1 and j == 0:
+        return 1 + la * rho
+    if i == 1 and j == 1:
+        return 1 - rho
+    return 1.0
+
+
+def market_probs(lh, la, maxg=10):
+    grid, total = {}, 0.0
+    for i in range(maxg + 1):
+        for j in range(maxg + 1):
+            p = poisson_pmf(i, lh) * poisson_pmf(j, la) * tau(i, j, lh, la, DC_RHO)
+            grid[(i, j)] = p
+            total += p
+
+    def P(cond):
+        return sum(p for (i, j), p in grid.items() if cond(i, j)) / total
+
+    return {
+        "1": P(lambda i, j: i > j),
+        "X": P(lambda i, j: i == j),
+        "2": P(lambda i, j: i < j),
+        "1X": P(lambda i, j: i >= j),
+        "X2": P(lambda i, j: i <= j),
+        "12": P(lambda i, j: i != j),
+        "U1.5": P(lambda i, j: i + j <= 1),
+        "O1.5": P(lambda i, j: i + j >= 2),
+        "U2.5": P(lambda i, j: i + j <= 2),
+        "O2.5": P(lambda i, j: i + j >= 3),
+        "U3.5": P(lambda i, j: i + j <= 3),
+        "O3.5": P(lambda i, j: i + j >= 4),
+        "GG": P(lambda i, j: i > 0 and j > 0),
+        "NG": P(lambda i, j: i == 0 or j == 0),
+    }
+
+
+def choose_picks(probs):
+    """Ritorna (giocata_sicura, giocata_piu_quota) come (chiave, prob)."""
+    safe_c = [(k, p) for k, p in probs.items() if MIN_PROB <= p <= MAX_SAFE_PROB]
+    if not safe_c:
+        return None, None
+    safe = max(safe_c, key=lambda x: x[1])
+    bold_c = [(k, p) for k, p in probs.items()
+              if BOLD_MIN_PROB <= p <= safe[1] - 0.06 and k != safe[0]]
+    bold = min(bold_c, key=lambda x: x[1]) if bold_c else None
+    return safe, bold
+
+
+# ----------------------------- CALENDARI -------------------------------
+def load_club_matches(div, today):
+    out = []
+    for code in season_codes(today):
+        url = HISTORY_URL.format(season=code, div=div)
+        try:
+            rows = read_csv(download(url))
+        except Exception as e:
+            print("  ! storico %s %s non scaricabile: %s" % (div, code, e))
+            continue
+        for r in rows:
+            d = parse_date(r.get("Date"))
+            try:
+                hg, ag = int(r["FTHG"]), int(r["FTAG"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not d or d >= today:
+                continue
+            w = 0.5 ** ((today - d).days / HALF_LIFE_CLUB)
+            out.append((r["HomeTeam"], r["AwayTeam"], hg, ag, w, False))
+    return out
+
+
+def club_matches(today, last):
+    """Ritorna (lista_partite, note). Ogni partita e' un dict."""
+    try:
+        fixtures = read_csv(download(FIXTURES_URL))
+    except Exception as e:
+        return [], ["Calendario club non scaricabile: %s" % e]
+
+    todays = []
+    for r in fixtures:
+        d = parse_date(r.get("Date"))
+        if r.get("Div") in LEAGUES and d and today <= d <= last:
+            todays.append(r)
+    if not todays:
+        return [], ["Nessuna partita dei 5 campionati nel periodo richiesto."]
+
+    models, out, skipped = {}, [], 0
+    for r in todays:
+        div = r["Div"]
+        if div not in models:
+            print("Calcolo modello %s..." % LEAGUES[div])
+            ms = load_club_matches(div, today)
+            models[div] = fit_poisson(ms, SHRINK_CLUB) if ms else None
+        model = models[div]
+        xg = (expected_goals(model, r["HomeTeam"], r["AwayTeam"], False, MIN_W_CLUB)
+              if model else None)
+        if not xg:
+            skipped += 1
+            continue
+        odds = {}
+        for key, suffix in ODDS_COLUMNS.items():
+            o, book = best_odds(r, suffix)
+            if o:
+                odds[key] = (o, book)
+        out.append({
+            "league": LEAGUES[div],
+            "time": (r.get("Time") or "").strip(),
+            "home": r["HomeTeam"], "away": r["AwayTeam"],
+            "xg": xg, "probs": market_probs(*xg), "odds": odds,
+        })
+    notes = ["%d partite saltate (dati insufficienti)." % skipped] if skipped else []
+    return out, notes
+
+
+def parse_iso_local(s):
+    s = (s or "").strip()
+    for cand in (s.replace("Z", "+00:00"),):
+        try:
+            dt = datetime.fromisoformat(cand)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone()
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%dT%H:%MZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).astimezone()
+        except ValueError:
+            continue
+    return None
+
+
+def espn_fixtures(today, last):
+    out, seen = [], set()
+    d = today
+    while d <= last:
+        for slug, label in ESPN_INTL:
+            url = ESPN_URL.format(slug=slug, d=d.strftime("%Y%m%d"))
+            try:
+                data = json.loads(download(url))
+            except Exception:
+                continue
+            for ev in data.get("events", []) or []:
+                comp = (ev.get("competitions") or [{}])[0]
+                state = (((ev.get("status") or {}).get("type") or {}).get("state"))
+                if state and state != "pre":
+                    continue
+                home = away = None
+                for c in comp.get("competitors", []) or []:
+                    nm = (c.get("team") or {}).get("displayName")
+                    if c.get("homeAway") == "home":
+                        home = nm
+                    elif c.get("homeAway") == "away":
+                        away = nm
+                if not home or not away or (home, away) in seen:
+                    continue
+                seen.add((home, away))
+                dt = parse_iso_local(ev.get("date"))
+                out.append((home, away, bool(comp.get("neutralSite")), label,
+                            dt.strftime("%H:%M") if dt else ""))
+        d += timedelta(days=1)
+    return out
+
+
+def intl_matches(today, last):
+    try:
+        rows = read_csv(download(INTL_URL))
+    except Exception as e:
+        return [], ["Dati nazionali non scaricabili: %s" % e]
+
+    hist, ds_fixtures = [], []
+    for r in rows:
+        d = parse_date(r.get("date"))
+        if not d:
+            continue
+        neutral = (r.get("neutral") or "").strip().upper() == "TRUE"
+        hs = (r.get("home_score") or "").strip()
+        as_ = (r.get("away_score") or "").strip()
+        scored = hs not in ("", "NA") and as_ not in ("", "NA")
+        age = (today - d).days
+        if scored and 0 < age <= INTL_YEARS * 365:
+            w = 0.5 ** (age / HALF_LIFE_INTL)
+            if (r.get("tournament") or "") == "Friendly":
+                w *= 0.6
+            hist.append((r["home_team"], r["away_team"],
+                         int(float(hs)), int(float(as_)), w, neutral))
+        elif not scored and today <= d <= last:
+            ds_fixtures.append((r["home_team"], r["away_team"], neutral,
+                                r.get("tournament") or "", ""))
+
+    fixtures = espn_fixtures(today, last)
+    if not fixtures:
+        fixtures = ds_fixtures
+    if not fixtures and today <= MANUAL_DATE <= last:
+        fixtures = [(h, a, n, t, "20:45") for h, a, n, t in MANUAL_FIXTURES]
+    if not fixtures:
+        return [], ["Nessuna partita tra nazionali trovata per queste date."]
+
+    print("Calcolo modello nazionali...")
+    model = fit_poisson(hist, SHRINK_INTL)
+    if not model:
+        return [], ["Storico nazionali vuoto."]
+    known = set(model["team_w"].keys())
+    out, notes = [], []
+    for h, a, neu, tour, time_s in fixtures:
+        h2, a2 = resolve_name(h, known), resolve_name(a, known)
+        xg = expected_goals(model, h2, a2, neu, MIN_W_INTL) if h2 and a2 else None
+        if not xg:
+            notes.append("Dati insufficienti o nome non riconosciuto: %s - %s" % (h, a))
+            continue
+        out.append({"league": tour, "time": time_s, "home": h, "away": a,
+                    "xg": xg, "probs": market_probs(*xg), "odds": {}})
+    return out, notes
+
+
+# ----------------------------- REPORT -----------------------------------
+def pick_line(prefix, key, p, odds):
+    line = "  %s %s - prob %.0f%% - gioca se quota >= %.2f" % (
+        prefix, MARKET_LABELS[key], p * 100, MARGIN / p)
+    if key in odds:
+        o, book = odds[key]
+        verdict = "OK" if o >= MARGIN / p else "troppo bassa"
+        line += "\n     quota trovata %.2f (%s): %s" % (o, book, verdict)
+    return line
+
+
+def build_report(today, last, with_club, with_intl):
+    lines = ["CONSIGLI DEL GIORNO - %s" % today.strftime("%d/%m/%Y")]
+    if last > today:
+        lines[0] += " -> %s" % last.strftime("%d/%m")
+    lines.append("Probabilita' stimate dal modello. Gioca solo se la quota "
+                 "reale e' pari o sopra il minimo indicato.")
+
+    matches, notes = [], []
+    if with_club:
+        m, n = club_matches(today, last)
+        matches += m
+        notes += n
+    if with_intl:
+        m, n = intl_matches(today, last)
+        matches += m
+        notes += n
+
+    rows = []
+    for m in matches:
+        safe, bold = choose_picks(m["probs"])
+        rows.append((m, safe, bold))
+
+    top = sorted([r for r in rows if r[1]], key=lambda r: r[1][1], reverse=True)[:5]
+    lines += ["", "== TOP DEL GIORNO =="]
+    if top:
+        for i, (m, safe, _) in enumerate(top, 1):
+            lines.append("%d. %s - %s: %s (%.0f%%), quota min %.2f" % (
+                i, m["home"], m["away"], MARKET_LABELS[safe[0]], safe[1] * 100,
+                MARGIN / safe[1]))
+    else:
+        lines.append("Nessuna giocata abbastanza solida oggi: meglio saltare.")
+
+    lines += ["", "== DETTAGLIO PARTITE =="]
+    rows.sort(key=lambda r: (r[0]["league"], r[0]["time"]))
+    for m, safe, bold in rows:
+        lines.append("")
+        lines.append("%s %s | %s - %s (gol attesi %.1f-%.1f)" % (
+            m["league"], m["time"], m["home"], m["away"], m["xg"][0], m["xg"][1]))
+        if not safe:
+            lines.append("  Partita incerta: salta.")
+            continue
+        lines.append(pick_line("SICURA:", safe[0], safe[1], m["odds"]))
+        if bold:
+            lines.append(pick_line("PIU' QUOTA (piu' rischio):", bold[0], bold[1], m["odds"]))
+
+    if notes:
+        lines += [""] + notes
+    lines += ["", "Nota: modello semplice, senza infortuni e formazioni. "
+              "Nessuna giocata e' sicura al 100%."]
+    return "\n".join(lines)
+
+
+def send_ntfy(text):
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            "https://ntfy.sh/" + topic,
+            data=text[:3800].encode("utf-8"),
+            headers={"Title": "Consigli del giorno"})
+        urllib.request.urlopen(req, timeout=20)
+        print("Notifica inviata su ntfy.")
+    except Exception as e:
+        print("Notifica non inviata: %s" % e)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=1)
+    ap.add_argument("--no-intl", action="store_true")
+    ap.add_argument("--no-club", action="store_true")
+    args, _ = ap.parse_known_args()
+
+    today = date.today()
+    last = today + timedelta(days=max(args.days, 1) - 1)
+    report = build_report(today, last, not args.no_club, not args.no_intl)
+    print("\n" + report)
+    send_ntfy(report)
+
+
+if __name__ == "__main__":
+    main()
