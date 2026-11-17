@@ -6,6 +6,7 @@ import argparse
 import html
 import os
 import traceback
+import urllib.request
 from datetime import date, datetime, timedelta
 
 import value_bet as vb
@@ -39,6 +40,37 @@ color:#fff;text-decoration:none;font-weight:600}
 </body></html>""" % (html.escape(updated), run_link, html.escape(body))
 
 
+def summary(report):
+    """Estrae solo la sezione TOP DEL GIORNO per la notifica."""
+    out, on = [], False
+    for ln in report.splitlines():
+        if ln.startswith("== TOP DEL GIORNO"):
+            on = True
+            continue
+        if on and ln.startswith("=="):
+            break
+        if on and ln.strip():
+            out.append(ln)
+    return "\n".join(out) or "Nessuna giocata solida oggi."
+
+
+def notify(text, click):
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    headers = {"Title": "Consigli del giorno"}
+    if click:
+        headers["Click"] = click   # toccando la notifica si apre la pagina
+    try:
+        req = urllib.request.Request("https://ntfy.sh/" + topic,
+                                     data=text[:3500].encode("utf-8"),
+                                     headers=headers)
+        urllib.request.urlopen(req, timeout=20)
+        print("Notifica inviata.")
+    except Exception as e:
+        print("Notifica non inviata: %s" % e)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=1)
@@ -61,8 +93,9 @@ def main():
     with open("site/report.txt", "w", encoding="utf-8") as f:
         f.write(report)
     print(report)
-    if not report.startswith("ERRORE"):
-        vb.send_ntfy(report)
+    # notifica solo per le esecuzioni automatiche o manuali, non a ogni modifica
+    if not report.startswith("ERRORE") and os.environ.get("EVENT") != "push":
+        notify(summary(report), os.environ.get("PAGE_URL"))
 
 
 if __name__ == "__main__":
