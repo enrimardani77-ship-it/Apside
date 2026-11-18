@@ -1,0 +1,37 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      grid:
+        description: "Prova anche altri parametri (scrivi si, piu' lento: 15-20 minuti)"
+        default: "no"
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Esegui backtest
+        env:
+          TZ: Europe/Rome
+          GRID: ${{ github.event.inputs.grid }}
+        run: |
+          if [ "$GRID" = "si" ]; then
+            python backtest.py --grid | tee report.txt
+          else
+            python backtest.py | tee report.txt
+          fi
+          {
+            echo '## Risultato del backtest'
+            echo '```'
+            sed -n '/^BACKTEST/,$p' report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
