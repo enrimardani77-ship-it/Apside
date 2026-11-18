@@ -81,8 +81,14 @@ MIN_W_CLUB = 4.0         # dati minimi (pesati) per fidarsi di una squadra
 MIN_W_INTL = 2.0
 DC_RHO = -0.10           # correzione Dixon-Coles per i punteggi bassi
 
+# Partite squilibrate: le goleade sono piu' frequenti di quanto dica il modello,
+# quindi per queste non consiglio gli Under.
+MISMATCH_XG = 1.8        # la favorita segna 1.8+ gol attesi
+MISMATCH_RATIO = 2.2     # oppure ha almeno 2.2 volte i gol attesi dell'altra
+UNDER_KEYS = ("U1.5", "U2.5", "U3.5")
+
 MIN_PROB = 0.60          # sotto questa probabilita' non consiglio nulla
-MAX_SAFE_PROB = 0.86     # sopra questa la quota sarebbe < ~1.16 (inutile)
+MAX_SAFE_PROB = 0.80     # sopra questa la quota sarebbe < 1.25: gamba che non rende
 BOLD_MIN_PROB = 0.55     # per l'alternativa "piu' quota"
 MARGIN = 1.05            # quota minima = MARGIN / probabilita'
 
@@ -283,6 +289,12 @@ def market_probs(lh, la, maxg=10):
         "GG": P(lambda i, j: i > 0 and j > 0),
         "NG": P(lambda i, j: i == 0 or j == 0),
     }
+
+
+def is_mismatch(xg):
+    lh, la = xg
+    hi, lo = max(lh, la), max(min(lh, la), 0.05)
+    return hi >= MISMATCH_XG or hi / lo >= MISMATCH_RATIO
 
 
 def choose_picks(probs):
@@ -689,7 +701,11 @@ def build_report(today, last, with_club, with_intl, with_props=True):
 
     rows = []
     for m in matches:
-        safe, bold = choose_picks(m["probs"])
+        m["mismatch"] = is_mismatch(m["xg"])
+        probs = m["probs"]
+        if m["mismatch"]:
+            probs = {k: p for k, p in probs.items() if k not in UNDER_KEYS}
+        safe, bold = choose_picks(probs)
         rows.append((m, safe, bold))
 
     top = sorted([r for r in rows if r[1]], key=lambda r: r[1][1], reverse=True)[:5]
@@ -702,6 +718,17 @@ def build_report(today, last, with_club, with_intl, with_props=True):
     else:
         lines.append("Nessuna giocata abbastanza solida oggi: meglio saltare.")
 
+    if len(top) >= 2:
+        lines += ["", "== COME GIOCARLE =="]
+        lines.append("Meglio singole o al massimo doppie. Le multiple lunghe perdono quasi sempre:")
+        for n in (2, 3, 5):
+            if len(top) >= n:
+                p = 1.0
+                for r in top[:n]:
+                    p *= r[1][1]
+                lines.append("  prime %d insieme: passano %.0f%% delle volte, quota minima %.2f" % (
+                    n, p * 100, MARGIN / p))
+
     lines += ["", "== DETTAGLIO PARTITE =="]
     rows.sort(key=lambda r: (r[0]["league"], r[0]["time"]))
     for m, safe, bold in rows:
@@ -710,6 +737,8 @@ def build_report(today, last, with_club, with_intl, with_props=True):
             m["league"], m["time"], m["home"], m["away"], m["xg"][0], m["xg"][1]))
         for n in m.get("notes", []):
             lines.append("  " + n)
+        if m.get("mismatch"):
+            lines.append("  Partita squilibrata: niente Under (le goleade sono piu' frequenti).")
         if not safe:
             lines.append("  Partita incerta: salta.")
         else:
