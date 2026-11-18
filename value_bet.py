@@ -57,6 +57,21 @@ ESPN_INTL = [
     ("concacaf.nations.league", "Nations League CONCACAF"),
 ]
 
+# Infortuni Premier League: API ufficiale del Fantasy Premier League (gratis, senza chiave)
+FPL_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
+FPL_ATT_WEIGHT = 0.5    # quanto pesa l'assenza di chi segna/fa assist (0-1)
+FPL_ATT_CAP = 0.25      # calo massimo dei gol attesi di una squadra
+FPL_GK_BOOST = 0.07     # +7% ai gol dell'avversario se manca il portiere titolare
+FPL_DEF_BOOST = 0.025   # +2.5% per ogni difensore titolare assente
+FPL_DEF_CAP = 0.15      # aumento massimo dei gol subiti
+# Queste cifre sono stime: andranno tarate quando avremo lo storico dei risultati.
+
+# Props (cartellini, tiri in porta): margine piu' alto perche' i bookmaker
+# applicano commissioni maggiori su questi mercati.
+PROPS_MARGIN = 1.10
+YELLOW_PRIOR_RATE = 0.12   # ammonizioni ogni 90' di un giocatore "medio"
+YELLOW_PRIOR_W = 5.0       # peso di questo valore iniziale (in partite da 90')
+
 HALF_LIFE_CLUB = 240     # giorni: il peso di una partita si dimezza ogni 240 gg
 HALF_LIFE_INTL = 365
 INTL_YEARS = 4
@@ -88,6 +103,8 @@ MANUAL_FIXTURES = [
 NAME_ALIASES = {
     "Bosnia-Herzegovina": "Bosnia and Herzegovina",
     "Bosnia & Herzegovina": "Bosnia and Herzegovina",
+    "Man Utd": "Man United",
+    "Spurs": "Tottenham",
     "Ireland": "Republic of Ireland",
     "Czechia": "Czech Republic",
     "Turkiye": "Turkey",
@@ -281,7 +298,8 @@ def choose_picks(probs):
 
 
 # ----------------------------- CALENDARI -------------------------------
-def load_club_matches(div, today):
+def load_club_rows(div, today):
+    """Storico partite con gol, gialli e tiri in porta (se presenti nel CSV)."""
     out = []
     for code in season_codes(today):
         url = HISTORY_URL.format(season=code, div=div)
@@ -299,11 +317,188 @@ def load_club_matches(div, today):
             if not d or d >= today:
                 continue
             w = 0.5 ** ((today - d).days / HALF_LIFE_CLUB)
-            out.append((r["HomeTeam"], r["AwayTeam"], hg, ag, w, False))
+            stats = {"hg": hg, "ag": ag}
+            for key, col in (("hy", "HY"), ("ay", "AY"), ("hst", "HST"), ("ast", "AST")):
+                try:
+                    stats[key] = int(r[col])
+                except (KeyError, ValueError, TypeError):
+                    stats[key] = None
+            out.append((r["HomeTeam"], r["AwayTeam"], w, stats))
     return out
 
 
-def club_matches(today, last):
+def build_models(rows):
+    """Un modello per i gol, uno per i cartellini gialli, uno per i tiri in porta."""
+    def mk(kh, ka):
+        ms = [(h, a, s[kh], s[ka], w, False) for h, a, w, s in rows
+              if s[kh] is not None and s[ka] is not None]
+        return fit_poisson(ms, SHRINK_CLUB) if ms else None
+    return {"goals": mk("hg", "ag"), "cards": mk("hy", "ay"), "sot": mk("hst", "ast")}
+
+
+# ----------------------------- INFORTUNI (FPL) ---------------------------
+STATUS_LABELS = {"i": "infortunato", "d": "in dubbio", "s": "squalificato",
+                 "u": "non disponibile", "n": "non disponibile"}
+
+
+def load_fpl_map(known):
+    """Ritorna {nome squadra football-data: [giocatori FPL]} oppure None."""
+    try:
+        data = json.loads(download(FPL_URL))
+    except Exception as e:
+        print("  ! FPL non disponibile: %s" % e)
+        return None
+    names = {t["id"]: t["name"] for t in data.get("teams", [])}
+    out = defaultdict(list)
+    for p in data.get("elements", []):
+        fpl_name = names.get(p.get("team"))
+        if not fpl_name:
+            continue
+        mapped = resolve_name(fpl_name, known)
+        if mapped:
+            out[mapped].append(p)
+    return dict(out)
+
+
+def miss_prob(p):
+    """Probabilita' (0-1) che il giocatore non giochi."""
+    chance = p.get("chance_of_playing_next_round")
+    status = p.get("status")
+    if status in ("i", "s", "u", "n"):
+        return 1.0 if chance is None else 1.0 - chance / 100.0
+    if status == "d":
+        return 0.5 if chance is None else 1.0 - chance / 100.0
+    return 0.0
+
+
+def team_absence_effect(players):
+    """Ritorna (calo_attacco, aumento_gol_subiti, assenze_chiave)."""
+    tot = sum(p.get("goals_scored", 0) + 0.5 * p.get("assists", 0) for p in players)
+    max_min = max((p.get("minutes", 0) for p in players), default=0)
+    gks = sorted((p for p in players if p.get("element_type") == 1),
+                 key=lambda p: p.get("minutes", 0), reverse=True)
+    starter_gk = gks[0] if gks else None
+    att_loss = def_up = 0.0
+    key = []
+    for p in players:
+        mp = miss_prob(p)
+        if mp <= 0:
+            continue
+        share = ((p.get("goals_scored", 0) + 0.5 * p.get("assists", 0)) / tot) if tot > 0 else 0.0
+        starter = max_min > 0 and p.get("minutes", 0) >= 0.5 * max_min
+        relevant = False
+        if share >= 0.04:
+            att_loss += FPL_ATT_WEIGHT * share * mp
+            relevant = True
+        if p is starter_gk and starter:
+            def_up += FPL_GK_BOOST * mp
+            relevant = True
+        elif p.get("element_type") == 2 and starter:
+            def_up += FPL_DEF_BOOST * mp
+            relevant = True
+        if relevant:
+            label = STATUS_LABELS.get(p.get("status"), "assente")
+            chance = p.get("chance_of_playing_next_round")
+            if chance is not None and 0 < chance < 100:
+                label += " %d%%" % chance
+            key.append((share * mp, "%s (%s)" % (p.get("web_name", "?"), label)))
+    key.sort(reverse=True)
+    return att_loss, def_up, [k[1] for k in key[:3]]
+
+
+def apply_absences(xg, home_players, away_players):
+    lh, la = xg
+    h_loss, h_def, h_names = team_absence_effect(home_players)
+    a_loss, a_def, a_names = team_absence_effect(away_players)
+    new_lh = lh * (1 - min(h_loss, FPL_ATT_CAP)) * (1 + min(a_def, FPL_DEF_CAP))
+    new_la = la * (1 - min(a_loss, FPL_ATT_CAP)) * (1 + min(h_def, FPL_DEF_CAP))
+    notes = []
+    if h_names:
+        notes.append("Assenze casa: " + ", ".join(h_names))
+    if a_names:
+        notes.append("Assenze ospite: " + ", ".join(a_names))
+    dh, da = new_lh / lh - 1, new_la / la - 1
+    if notes and (abs(dh) >= 0.01 or abs(da) >= 0.01):
+        notes.append("Effetto sui gol attesi: casa %+.0f%%, ospite %+.0f%%" % (dh * 100, da * 100))
+    return (new_lh, new_la), notes
+
+
+# ----------------------------- PROPS: CARTELLINI E TIRI IN PORTA ---------
+def poisson_over(lam, line):
+    """P(X > line) per una Poisson, con line del tipo 3.5."""
+    k = int(line)
+    cdf = sum(poisson_pmf(i, lam) for i in range(k + 1))
+    return max(0.0, min(1.0, 1 - cdf))
+
+
+def count_markets(label, home, away, lam_h, lam_a, total_lines, team_lines):
+    out = {}
+    for line in total_lines:
+        p = poisson_over(lam_h + lam_a, line)
+        out["%s totali Over %.1f" % (label, line)] = p
+        out["%s totali Under %.1f" % (label, line)] = 1 - p
+    for name, lam in ((home, lam_h), (away, lam_a)):
+        for line in team_lines:
+            p = poisson_over(lam, line)
+            out["%s %s Over %.1f" % (label, name, line)] = p
+            out["%s %s Under %.1f" % (label, name, line)] = 1 - p
+    return out
+
+
+def player_card_probs(players, lam_cards):
+    """Probabilita' di ammonizione dei giocatori di una squadra (dati FPL).
+    lam_cards = gialli attesi dalla squadra in questa partita."""
+    max_min = max((p.get("minutes", 0) for p in players), default=0)
+    if max_min <= 0:
+        return []
+    games = max_min / 90.0
+    team_avg = sum(p.get("yellow_cards", 0) for p in players) / games
+    f = lam_cards / team_avg if team_avg > 0 else 1.0
+    f = max(0.7, min(1.4, f))
+    out = []
+    for p in players:
+        exp_min = 90.0 * min(1.0, p.get("minutes", 0) / max_min) * (1 - miss_prob(p))
+        if exp_min < 45:
+            continue
+        m90 = p.get("minutes", 0) / 90.0
+        rate = (p.get("yellow_cards", 0) + YELLOW_PRIOR_RATE * YELLOW_PRIOR_W) / (m90 + YELLOW_PRIOR_W)
+        prob = 1 - math.exp(-rate * (exp_min / 90.0) * f)
+        out.append((prob, p.get("web_name", "?")))
+    return out
+
+
+def build_props(model, r, div, fpl_map):
+    home, away = r["HomeTeam"], r["AwayTeam"]
+    cards = (expected_goals(model["cards"], home, away, False, MIN_W_CLUB)
+             if model.get("cards") else None)
+    sot = (expected_goals(model["sot"], home, away, False, MIN_W_CLUB)
+           if model.get("sot") else None)
+    lines = []
+    if cards:
+        pool = count_markets("Cartellini", home, away, cards[0], cards[1], (3.5, 4.5, 5.5), (1.5, 2.5))
+        safe, _ = choose_picks(pool)
+        if safe:
+            lines.append("%s - prob %.0f%% - gioca se quota >= %.2f" % (
+                safe[0], safe[1] * 100, PROPS_MARGIN / safe[1]))
+    if sot:
+        pool = count_markets("Tiri in porta", home, away, sot[0], sot[1], (7.5, 8.5, 9.5), (3.5, 4.5, 5.5))
+        safe, _ = choose_picks(pool)
+        if safe:
+            lines.append("%s - prob %.0f%% - gioca se quota >= %.2f" % (
+                safe[0], safe[1] * 100, PROPS_MARGIN / safe[1]))
+    if cards and div == "E0" and fpl_map:
+        hp, ap = fpl_map.get(home), fpl_map.get(away)
+        if hp and ap:
+            cand = player_card_probs(hp, cards[0]) + player_card_probs(ap, cards[1])
+            cand.sort(reverse=True)
+            top = [c for c in cand[:3] if c[0] > 0.0]
+            if top:
+                lines.append("Ammonizione (probabilita' basse, rischio alto): " + ", ".join(
+                    "%s %.0f%% (quota min %.2f)" % (n, p * 100, PROPS_MARGIN / p) for p, n in top))
+    return lines
+
+
+def club_matches(today, last, with_props=True):
     """Ritorna (lista_partite, note). Ogni partita e' un dict."""
     try:
         fixtures = read_csv(download(FIXTURES_URL))
@@ -318,19 +513,32 @@ def club_matches(today, last):
     if not todays:
         return [], ["Nessuna partita dei 5 campionati nel periodo richiesto."]
 
+    fpl_map, fpl_failed = None, False
+    e0 = [r for r in todays if r["Div"] == "E0"]
+    if e0:
+        known = set(r["HomeTeam"] for r in e0) | set(r["AwayTeam"] for r in e0)
+        fpl_map = load_fpl_map(known)
+        fpl_failed = fpl_map is None
+
     models, out, skipped = {}, [], 0
     for r in todays:
         div = r["Div"]
         if div not in models:
             print("Calcolo modello %s..." % LEAGUES[div])
-            ms = load_club_matches(div, today)
-            models[div] = fit_poisson(ms, SHRINK_CLUB) if ms else None
+            rows_h = load_club_rows(div, today)
+            models[div] = build_models(rows_h) if rows_h else None
         model = models[div]
-        xg = (expected_goals(model, r["HomeTeam"], r["AwayTeam"], False, MIN_W_CLUB)
-              if model else None)
+        gm = model["goals"] if model else None
+        xg = (expected_goals(gm, r["HomeTeam"], r["AwayTeam"], False, MIN_W_CLUB)
+              if gm else None)
         if not xg:
             skipped += 1
             continue
+        match_notes = []
+        if div == "E0" and fpl_map:
+            hp, ap = fpl_map.get(r["HomeTeam"]), fpl_map.get(r["AwayTeam"])
+            if hp and ap:
+                xg, match_notes = apply_absences(xg, hp, ap)
         odds = {}
         for key, suffix in ODDS_COLUMNS.items():
             o, book = best_odds(r, suffix)
@@ -341,8 +549,12 @@ def club_matches(today, last):
             "time": (r.get("Time") or "").strip(),
             "home": r["HomeTeam"], "away": r["AwayTeam"],
             "xg": xg, "probs": market_probs(*xg), "odds": odds,
+            "notes": match_notes,
+            "props": build_props(model, r, div, fpl_map) if (with_props and model) else [],
         })
     notes = ["%d partite saltate (dati insufficienti)." % skipped] if skipped else []
+    if fpl_failed:
+        notes.append("Infortuni Premier non disponibili (fonte FPL non raggiunta).")
     return out, notes
 
 
@@ -458,7 +670,7 @@ def pick_line(prefix, key, p, odds):
     return line
 
 
-def build_report(today, last, with_club, with_intl):
+def build_report(today, last, with_club, with_intl, with_props=True):
     lines = ["CONSIGLI DEL GIORNO - %s" % today.strftime("%d/%m/%Y")]
     if last > today:
         lines[0] += " -> %s" % last.strftime("%d/%m")
@@ -467,7 +679,7 @@ def build_report(today, last, with_club, with_intl):
 
     matches, notes = [], []
     if with_club:
-        m, n = club_matches(today, last)
+        m, n = club_matches(today, last, with_props)
         matches += m
         notes += n
     if with_intl:
@@ -496,17 +708,26 @@ def build_report(today, last, with_club, with_intl):
         lines.append("")
         lines.append("%s %s | %s - %s (gol attesi %.1f-%.1f)" % (
             m["league"], m["time"], m["home"], m["away"], m["xg"][0], m["xg"][1]))
+        for n in m.get("notes", []):
+            lines.append("  " + n)
         if not safe:
             lines.append("  Partita incerta: salta.")
-            continue
-        lines.append(pick_line("SICURA:", safe[0], safe[1], m["odds"]))
-        if bold:
-            lines.append(pick_line("PIU' QUOTA (piu' rischio):", bold[0], bold[1], m["odds"]))
+        else:
+            lines.append(pick_line("SICURA:", safe[0], safe[1], m["odds"]))
+            if bold:
+                lines.append(pick_line("PIU' QUOTA (piu' rischio):", bold[0], bold[1], m["odds"]))
+        for pl in m.get("props", []):
+            lines.append("  " + pl)
 
     if notes:
         lines += [""] + notes
-    lines += ["", "Nota: modello semplice, senza infortuni e formazioni. "
-              "Nessuna giocata e' sicura al 100%."]
+    if with_props and any(m.get("props") for m in matches):
+        lines += ["", "Cartellini e tiri in porta: i cartellini contano solo i gialli (controlla "
+                  "come li conta il tuo bookmaker). Non vedo le quote di questi mercati: "
+                  "confronta con la quota minima. Le ammonizioni valgono solo se il giocatore "
+                  "parte titolare (le formazioni escono circa 1 ora prima)."]
+    lines += ["", "Nota: modello semplice. Infortuni considerati solo per la Premier, "
+              "formazioni ufficiali no. Nessuna giocata e' sicura al 100%."]
     return "\n".join(lines)
 
 
@@ -530,11 +751,12 @@ def main():
     ap.add_argument("--days", type=int, default=1)
     ap.add_argument("--no-intl", action="store_true")
     ap.add_argument("--no-club", action="store_true")
+    ap.add_argument("--no-props", action="store_true")
     args, _ = ap.parse_known_args()
 
     today = date.today()
     last = today + timedelta(days=max(args.days, 1) - 1)
-    report = build_report(today, last, not args.no_club, not args.no_intl)
+    report = build_report(today, last, not args.no_club, not args.no_intl, not args.no_props)
     print("\n" + report)
     send_ntfy(report)
 
