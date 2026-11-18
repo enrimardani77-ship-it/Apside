@@ -1,19 +1,19 @@
-name: Backtest
+name: "Taratura dell'Oracolo"
 
 on:
   workflow_dispatch:
     inputs:
-      grid:
-        description: "Prova anche altri parametri (scrivi si, piu' lento: 15-20 minuti)"
+      tune:
+        description: "Scrivi si per cercare e salvare i parametri migliori (circa 20-30 minuti). Con no misura soltanto."
         default: "no"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,16 +22,25 @@ jobs:
       - name: Esegui backtest
         env:
           TZ: Europe/Rome
-          GRID: ${{ github.event.inputs.grid }}
+          TUNE: ${{ github.event.inputs.tune }}
         run: |
-          if [ "$GRID" = "si" ]; then
-            python backtest.py --grid | tee report.txt
+          if [ "$TUNE" = "si" ]; then
+            python backtest.py --tune | tee report.txt
           else
             python backtest.py | tee report.txt
           fi
           {
-            echo '## Risultato del backtest'
+            echo '## Risultato'
             echo '```'
-            sed -n '/^BACKTEST/,$p' report.txt
+            sed -n '/DELL.ORACOLO/,$p' report.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Salva i parametri migliori
+        if: ${{ github.event.inputs.tune == 'si' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/params.json
+          git commit -m "Aggiorna i parametri dell'Oracolo" || echo "Niente da salvare"
+          git pull --rebase origin main || true
+          git push || true
