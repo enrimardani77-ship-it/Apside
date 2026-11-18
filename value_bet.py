@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Consigli del giorno - 5 top campionati europei + nazionali
+L'Oracolo - consigli sul calcio: 5 top campionati europei + nazionali
 ----------------------------------------------------------
 Per ogni partita ti dice COSA giocare (es. "Genoa-Parma: Under 3.5") e la
 QUOTA MINIMA sotto cui non conviene. Nessuna chiave API, nessun login.
@@ -83,8 +83,11 @@ DC_RHO = -0.10           # correzione Dixon-Coles per i punteggi bassi
 
 # Partite squilibrate: le goleade sono piu' frequenti di quanto dica il modello,
 # quindi per queste non consiglio gli Under.
-MISMATCH_XG = 1.8        # la favorita segna 1.8+ gol attesi
+MISMATCH_XG_CLUB = 1.8   # club: la favorita segna 1.8+ gol attesi
+MISMATCH_XG_INTL = 1.8   # nazionali
 MISMATCH_RATIO = 2.2     # oppure ha almeno 2.2 volte i gol attesi dell'altra
+SPREAD_CLUB = 0.0        # incertezza sui gol totali (0 = nessuna), club
+SPREAD_INTL = 0.0        # idem, nazionali
 UNDER_KEYS = ("U1.5", "U2.5", "U3.5")
 
 MIN_PROB = 0.60          # sotto questa probabilita' non consiglio nulla
@@ -139,6 +142,26 @@ MARKET_LABELS = {
 }
 # colonne quote football-data per i mercati che ci sono nel CSV
 ODDS_COLUMNS = {"1": "H", "X": "D", "2": "A", "O2.5": ">2.5", "U2.5": "<2.5"}
+
+
+# Parametri ottimizzati dal backtest: se esiste data/params.json sostituiscono
+# i valori di default qui sopra (per tornare indietro basta cancellare il file).
+PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "params.json")
+try:
+    with open(PARAMS_FILE, encoding="utf-8") as _f:
+        _P = json.load(_f)
+except Exception:
+    _P = {}
+HALF_LIFE_CLUB = _P.get("half_life_club", HALF_LIFE_CLUB)
+HALF_LIFE_INTL = _P.get("half_life_intl", HALF_LIFE_INTL)
+SHRINK_CLUB = _P.get("shrink_club", SHRINK_CLUB)
+SHRINK_INTL = _P.get("shrink_intl", SHRINK_INTL)
+SPREAD_CLUB = _P.get("spread_club", SPREAD_CLUB)
+SPREAD_INTL = _P.get("spread_intl", SPREAD_INTL)
+DC_RHO = _P.get("dc_rho", DC_RHO)
+MISMATCH_XG_CLUB = _P.get("mismatch_xg_club", MISMATCH_XG_CLUB)
+MISMATCH_XG_INTL = _P.get("mismatch_xg_intl", MISMATCH_XG_INTL)
+MISMATCH_RATIO = _P.get("mismatch_ratio", MISMATCH_RATIO)
 
 
 # ----------------------------- UTILITA' --------------------------------
@@ -262,7 +285,7 @@ def tau(i, j, lh, la, rho):
     return 1.0
 
 
-def market_probs(lh, la, maxg=10):
+def _market_probs_single(lh, la, maxg=10):
     grid, total = {}, 0.0
     for i in range(maxg + 1):
         for j in range(maxg + 1):
@@ -291,10 +314,28 @@ def market_probs(lh, la, maxg=10):
     }
 
 
-def is_mismatch(xg):
+def market_probs(lh, la, maxg=10, spread=0.0):
+    """Probabilita' dei mercati. Con spread > 0 media tre scenari di gol totali
+    (-spread, 0, +spread): rende piu' realistiche le code (goleade e 0-0)."""
+    if spread <= 0:
+        return _market_probs_single(lh, la, maxg)
+    acc = None
+    for sgn, w in ((-1, 0.3), (0, 0.4), (1, 0.3)):
+        f = 1 + sgn * spread
+        p = _market_probs_single(lh * f, la * f, maxg)
+        if acc is None:
+            acc = {k: w * v for k, v in p.items()}
+        else:
+            for k, v in p.items():
+                acc[k] += w * v
+    return acc
+
+
+def is_mismatch(xg, kind="club"):
     lh, la = xg
     hi, lo = max(lh, la), max(min(lh, la), 0.05)
-    return hi >= MISMATCH_XG or hi / lo >= MISMATCH_RATIO
+    thr = MISMATCH_XG_INTL if kind == "intl" else MISMATCH_XG_CLUB
+    return hi >= thr or hi / lo >= MISMATCH_RATIO
 
 
 def choose_picks(probs):
@@ -561,7 +602,7 @@ def club_matches(today, last, with_props=True):
             "date": parse_date(r.get("Date")).isoformat(),
             "time": (r.get("Time") or "").strip(),
             "home": r["HomeTeam"], "away": r["AwayTeam"],
-            "xg": xg, "probs": market_probs(*xg), "odds": odds,
+            "xg": xg, "probs": market_probs(*xg, spread=SPREAD_CLUB), "odds": odds,
             "notes": match_notes,
             "props": build_props(model, r, div, fpl_map) if (with_props and model) else [],
         })
@@ -668,7 +709,7 @@ def intl_matches(today, last):
             notes.append("Dati insufficienti o nome non riconosciuto: %s - %s" % (h, a))
             continue
         out.append({"league": tour, "time": time_s, "home": h, "away": a,
-                    "xg": xg, "probs": market_probs(*xg), "odds": {},
+                    "xg": xg, "probs": market_probs(*xg, spread=SPREAD_INTL), "odds": {},
                     "kind": "intl", "date": fdate.isoformat(),
                     "key_home": h2, "key_away": a2})
     return out, notes
@@ -685,8 +726,8 @@ def pick_line(prefix, key, p, odds):
     return line
 
 
-def build_report(today, last, with_club, with_intl, with_props=True, sink=None):
-    lines = ["CONSIGLI DEL GIORNO - %s" % today.strftime("%d/%m/%Y")]
+def build_report(today, last, with_club, with_intl, with_props=True, sink=None, view=None):
+    lines = ["L'ORACOLO - consigli del %s" % today.strftime("%d/%m/%Y")]
     if last > today:
         lines[0] += " -> %s" % last.strftime("%d/%m")
     lines.append("Probabilita' stimate dal modello. Gioca solo se la quota "
@@ -704,7 +745,7 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None):
 
     rows = []
     for m in matches:
-        m["mismatch"] = is_mismatch(m["xg"])
+        m["mismatch"] = is_mismatch(m["xg"], m.get("kind") or "club")
         probs = m["probs"]
         if m["mismatch"]:
             probs = {k: p for k, p in probs.items() if k not in UNDER_KEYS}
@@ -771,6 +812,42 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None):
 
     if notes:
         lines += [""] + notes
+    if view is not None:
+        def _pick(pk, odds):
+            if not pk:
+                return None
+            key, p = pk[0], pk[1]
+            d = {"label": MARKET_LABELS[key], "prob": round(p, 4),
+                 "minodds": round(MARGIN / p, 2)}
+            if key in odds:
+                o, book = odds[key]
+                d["odds"], d["book"], d["ok"] = o, book, bool(o >= MARGIN / p)
+            return d
+        combos = []
+        for n in (2, 3, 5):
+            if len(top) >= n:
+                pp = 1.0
+                for r in top[:n]:
+                    pp *= r[1][1]
+                combos.append({"n": n, "prob": round(pp, 4), "minodds": round(MARGIN / pp, 2)})
+        ordered = sorted(rows, key=lambda r: (r[0]["time"] or "99:99", r[0]["league"]))
+        view.update({
+            "date": today.strftime("%d/%m/%Y"),
+            "top": [{"home": m["home"], "away": m["away"], "league": m["league"],
+                     "time": m["time"], "label": MARKET_LABELS[s[0]],
+                     "prob": round(s[1], 4), "minodds": round(MARGIN / s[1], 2)}
+                    for m, s, _ in top],
+            "combos": combos,
+            "matches": [{"league": m["league"], "time": m["time"], "home": m["home"],
+                         "away": m["away"],
+                         "xg": [round(m["xg"][0], 1), round(m["xg"][1], 1)],
+                         "mismatch": bool(m.get("mismatch")),
+                         "safe": _pick(s, m["odds"]), "bold": _pick(b, m["odds"]),
+                         "notes": list(m.get("notes", [])), "props": list(m.get("props", []))}
+                        for m, s, b in ordered],
+            "notes": list(notes),
+        })
+
     if with_props and any(m.get("props") for m in matches):
         lines += ["", "Cartellini e tiri in porta: i cartellini contano solo i gialli (controlla "
                   "come li conta il tuo bookmaker). Non vedo le quote di questi mercati: "
@@ -789,7 +866,7 @@ def send_ntfy(text):
         req = urllib.request.Request(
             "https://ntfy.sh/" + topic,
             data=text[:3800].encode("utf-8"),
-            headers={"Title": "Consigli del giorno"})
+            headers={"Title": "L'Oracolo - consigli del giorno"})
         urllib.request.urlopen(req, timeout=20)
         print("Notifica inviata su ntfy.")
     except Exception as e:
