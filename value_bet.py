@@ -557,7 +557,8 @@ def club_matches(today, last, with_props=True):
             if o:
                 odds[key] = (o, book)
         out.append({
-            "league": LEAGUES[div],
+            "league": LEAGUES[div], "div": div, "kind": "club",
+            "date": parse_date(r.get("Date")).isoformat(),
             "time": (r.get("Time") or "").strip(),
             "home": r["HomeTeam"], "away": r["AwayTeam"],
             "xg": xg, "probs": market_probs(*xg), "odds": odds,
@@ -615,7 +616,7 @@ def espn_fixtures(today, last):
                 seen.add((home, away))
                 dt = parse_iso_local(ev.get("date"))
                 out.append((home, away, bool(comp.get("neutralSite")), label,
-                            dt.strftime("%H:%M") if dt else ""))
+                            dt.strftime("%H:%M") if dt else "", d))
         d += timedelta(days=1)
     return out
 
@@ -644,13 +645,13 @@ def intl_matches(today, last):
                          int(float(hs)), int(float(as_)), w, neutral))
         elif not scored and today <= d <= last:
             ds_fixtures.append((r["home_team"], r["away_team"], neutral,
-                                r.get("tournament") or "", ""))
+                                r.get("tournament") or "", "", d))
 
     fixtures = espn_fixtures(today, last)
     if not fixtures:
         fixtures = ds_fixtures
     if not fixtures and today <= MANUAL_DATE <= last:
-        fixtures = [(h, a, n, t, "20:45") for h, a, n, t in MANUAL_FIXTURES]
+        fixtures = [(h, a, n, t, "20:45", MANUAL_DATE) for h, a, n, t in MANUAL_FIXTURES]
     if not fixtures:
         return [], ["Nessuna partita tra nazionali trovata per queste date."]
 
@@ -660,14 +661,16 @@ def intl_matches(today, last):
         return [], ["Storico nazionali vuoto."]
     known = set(model["team_w"].keys())
     out, notes = [], []
-    for h, a, neu, tour, time_s in fixtures:
+    for h, a, neu, tour, time_s, fdate in fixtures:
         h2, a2 = resolve_name(h, known), resolve_name(a, known)
         xg = expected_goals(model, h2, a2, neu, MIN_W_INTL) if h2 and a2 else None
         if not xg:
             notes.append("Dati insufficienti o nome non riconosciuto: %s - %s" % (h, a))
             continue
         out.append({"league": tour, "time": time_s, "home": h, "away": a,
-                    "xg": xg, "probs": market_probs(*xg), "odds": {}})
+                    "xg": xg, "probs": market_probs(*xg), "odds": {},
+                    "kind": "intl", "date": fdate.isoformat(),
+                    "key_home": h2, "key_away": a2})
     return out, notes
 
 
@@ -682,7 +685,7 @@ def pick_line(prefix, key, p, odds):
     return line
 
 
-def build_report(today, last, with_club, with_intl, with_props=True):
+def build_report(today, last, with_club, with_intl, with_props=True, sink=None):
     lines = ["CONSIGLI DEL GIORNO - %s" % today.strftime("%d/%m/%Y")]
     if last > today:
         lines[0] += " -> %s" % last.strftime("%d/%m")
@@ -707,6 +710,24 @@ def build_report(today, last, with_club, with_intl, with_props=True):
             probs = {k: p for k, p in probs.items() if k not in UNDER_KEYS}
         safe, bold = choose_picks(probs)
         rows.append((m, safe, bold))
+
+    if sink is not None:
+        for m, safe, bold in rows:
+            def _pk(pk):
+                if not pk:
+                    return None
+                o = m["odds"].get(pk[0])
+                return [pk[0], round(pk[1], 4), o[0] if o else None]
+            sink.append({
+                "id": "%s|%s|%s" % (m.get("date"), m["home"], m["away"]),
+                "date": m.get("date"), "kind": m.get("kind"), "div": m.get("div"),
+                "league": m["league"], "home": m["home"], "away": m["away"],
+                "key_home": m.get("key_home"), "key_away": m.get("key_away"),
+                "xg": [round(m["xg"][0], 2), round(m["xg"][1], 2)],
+                "probs": {k: round(v, 4) for k, v in m["probs"].items()},
+                "mismatch": bool(m.get("mismatch")),
+                "safe": _pk(safe), "bold": _pk(bold), "result": None,
+            })
 
     top = sorted([r for r in rows if r[1]], key=lambda r: r[1][1], reverse=True)[:5]
     lines += ["", "== TOP DEL GIORNO =="]
