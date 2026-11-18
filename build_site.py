@@ -13,6 +13,7 @@ import traceback
 import urllib.request
 from datetime import date, datetime, timedelta
 
+import storico
 import value_bet as vb
 
 PAGE = """<!doctype html>
@@ -48,6 +49,9 @@ details{margin-top:18px;color:var(--mut);font-size:.92rem}
 </div>
 <div id="status" class="upd">Ultimo aggiornamento: __UPDATED__</div>
 <pre id="out">__REPORT__</pre>
+<details id="hist"><summary>Storico e precisione</summary>
+  <pre id="stats">__STATS__</pre>
+</details>
 <details id="settings"><summary>Impostazioni</summary>
   <p>Per avviare l’analisi da questa pagina serve un token GitHub. Resta salvato solo
   su questo telefono, non nel repository.</p>
@@ -80,6 +84,7 @@ async function getLatest() {
 
 function show(d) {
   $("out").textContent = d.report;
+  if (d.stats) $("stats").textContent = d.stats;
   status("Aggiornato: " + d.updated);
 }
 
@@ -180,10 +185,23 @@ def main():
 
     today = date.today()
     last = today + timedelta(days=max(args.days, 1) - 1)
+    sink = []
     try:
-        report = vb.build_report(today, last, not args.no_club, not args.no_intl)
+        report = vb.build_report(today, last, not args.no_club, not args.no_intl, sink=sink)
     except Exception:
         report = "ERRORE durante l'esecuzione:\n\n" + traceback.format_exc()
+
+    # storico: verifica le previsioni passate, salva le nuove, calcola la precisione
+    try:
+        preds = storico.load()
+        found = storico.resolve_pending(preds, today)
+        print("Risultati trovati per %d previsioni passate." % found)
+        if not report.startswith("ERRORE"):
+            storico.merge(preds, sink)
+        storico.save(preds)
+        stats = storico.stats_text(preds)
+    except Exception:
+        stats = "Storico non disponibile:\n" + traceback.format_exc()
 
     updated = datetime.now().strftime("%d/%m/%Y %H:%M")
     run_id = "%s-%s" % (os.environ.get("GITHUB_RUN_ID", "locale"),
@@ -191,11 +209,12 @@ def main():
 
     os.makedirs("site", exist_ok=True)
     os.makedirs("data", exist_ok=True)
-    page = PAGE.replace("__UPDATED__", html.escape(updated)).replace("__REPORT__", html.escape(report))
+    page = PAGE.replace("__UPDATED__", html.escape(updated)).replace("__REPORT__", html.escape(report)).replace("__STATS__", html.escape(stats))
     with open("site/index.html", "w", encoding="utf-8") as f:
         f.write(page)
     with open("data/latest.json", "w", encoding="utf-8") as f:
-        json.dump({"run_id": run_id, "updated": updated, "report": report}, f, ensure_ascii=False)
+        json.dump({"run_id": run_id, "updated": updated, "report": report, "stats": stats},
+                  f, ensure_ascii=False)
     print(report)
 
     if not report.startswith("ERRORE") and os.environ.get("EVENT") != "push":
