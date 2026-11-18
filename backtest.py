@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Backtest: quanto e' affidabile il modello su partite gia' giocate?
+"""Backtest e taratura dell'Oracolo.
 
 Simula di aver usato il bot in passato: ogni settimana stima le probabilita' con
 i soli dati precedenti e le confronta con quello che e' successo davvero.
 Per i club confronta anche il modello con le quote storiche dei bookmaker.
 
 Uso:
-  python backtest.py            # club + nazionali
-  python backtest.py --grid     # prova anche altre combinazioni di parametri (lento)
+  python backtest.py            # misura i parametri attuali (club + nazionali)
+  python backtest.py --tune     # cerca i parametri migliori e li salva in data/params.json
   python backtest.py --no-intl  # solo club
 """
 import argparse
-import math
+import json
+import os
 from collections import defaultdict
 from datetime import date, timedelta
 
@@ -21,6 +22,8 @@ from storico import outcomes
 TEST_DAYS = 730          # periodo su cui misuro (circa 2 stagioni)
 TRAIN_DAYS = 1100        # storico massimo usato per stimare i club
 REFIT_DAYS = 7           # ogni quanti giorni ristimo il modello (club)
+TUNE_REFIT_CLUB = 21     # durante la taratura, per fare piu' in fretta
+TUNE_REFIT_INTL = 45
 SEASONS_BACK = 4
 INTL_TRAIN_DAYS = vb.INTL_YEARS * 365
 INTL_REFIT_DAYS = 30
@@ -98,7 +101,8 @@ def load_intl(today):
 
 
 # ----------------------------- WALK-FORWARD ----------------------------
-def walk_forward(matches, half_life, shrink, train_days, refit_days, min_w, test_from, today):
+def walk_forward(matches, half_life, shrink, train_days, refit_days, min_w,
+                 test_from, today, spread=0.0):
     """Per ogni finestra stima il modello coi soli dati precedenti e prevede
     le partite della finestra. Ritorna una lista di previsioni."""
     out = []
@@ -123,9 +127,24 @@ def walk_forward(matches, half_life, shrink, train_days, refit_days, min_w, test
                 for m in batch:
                     xg = vb.expected_goals(model, m["h"], m["a"], m["neutral"], min_w)
                     if xg:
-                        out.append({"m": m, "xg": xg, "probs": vb.market_probs(*xg)})
+                        out.append({"m": m, "xg": xg,
+                                    "probs": vb.market_probs(*xg, spread=spread)})
         refit = nxt
     return out
+
+
+def run_club(data, today, half_life, shrink, refit_days=REFIT_DAYS, spread=0.0):
+    test_from = today - timedelta(days=TEST_DAYS)
+    preds = []
+    for div, ms in data.items():
+        preds += walk_forward(ms, half_life, shrink, TRAIN_DAYS, refit_days,
+                              vb.MIN_W_CLUB, test_from, today, spread)
+    return preds
+
+
+def run_intl(ms, today, half_life, shrink, refit_days=INTL_REFIT_DAYS, spread=0.0):
+    return walk_forward(ms, half_life, shrink, INTL_TRAIN_DAYS, refit_days,
+                        vb.MIN_W_INTL, today - timedelta(days=TEST_DAYS), today, spread)
 
 
 # ----------------------------- METRICHE ---------------------------------
@@ -151,13 +170,32 @@ def model_1x2(p):
     return [p["probs"]["1"], p["probs"]["X"], p["probs"]["2"]]
 
 
+def total(p):
+    return p["m"]["hg"] + p["m"]["ag"]
+
+
 def brier_1x2(preds):
     return _mean([brier3(model_1x2(p), result_idx(p["m"])) for p in preds])
 
 
 def brier_over(preds):
-    return _mean([(p["probs"]["O2.5"] - (1.0 if p["m"]["hg"] + p["m"]["ag"] >= 3 else 0.0)) ** 2
-                  for p in preds])
+    return _mean([(p["probs"]["O2.5"] - (1.0 if total(p) >= 3 else 0.0)) ** 2 for p in preds])
+
+
+def brier_u35(preds):
+    return _mean([(p["probs"]["U3.5"] - (1.0 if total(p) <= 3 else 0.0)) ** 2 for p in preds])
+
+
+def objective(preds):
+    """Punteggio da minimizzare: 1X2 + Over 2.5 + Under 3.5 (piu' basso = meglio)."""
+    if not preds:
+        return 9.9
+    return brier_1x2(preds) + 2 * brier_over(preds) + 2 * brier_u35(preds)
+
+
+def metrics_line(preds):
+    return "1X2 %.4f | Over 2.5 %.4f | Under 3.5 %.4f" % (
+        brier_1x2(preds), brier_over(preds), brier_u35(preds))
 
 
 def calib_line(name, pairs):
@@ -188,16 +226,29 @@ def pick_stats(label, lst):
     return t
 
 
-def summarize(preds, title, market):
+def xg_buckets(preds):
+    edges = [0.0, 1.5, 2.0, 2.5, 3.0, 4.0, 99.0]
+    L = ["Under 3.5 per gol attesi della favorita (previsto -> reale):"]
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = [p for p in preds if lo <= max(p["xg"]) < hi]
+        if len(sel) >= 20:
+            L.append("  %.1f%s: previsto %.0f%%, reale %.0f%% (n=%d)" % (
+                lo, "+" if hi >= 99 else "-%.1f" % hi,
+                100 * _mean([p["probs"]["U3.5"] for p in sel]),
+                100 * _mean([1.0 if total(p) <= 3 else 0.0 for p in sel]), len(sel)))
+    return L if len(L) > 1 else []
+
+
+def summarize(preds, title, market, kind):
     L = ["", "== %s: %d partite ==" % (title, len(preds))]
     if not preds:
         return L + ["Nessun dato disponibile."]
 
-    # 1) precisione: modello contro frequenze medie e contro il mercato
     freq = [_mean([1.0 if result_idx(p["m"]) == i else 0.0 for p in preds]) for i in range(3)]
     b_naive = _mean([brier3(freq, result_idx(p["m"])) for p in preds])
     L.append("Precisione 1X2 (Brier: piu' basso = meglio):")
     L.append("  modello %.3f | frequenze medie, senza modello %.3f" % (brier_1x2(preds), b_naive))
+    L.append("  Over 2.5 %.3f | Under 3.5 %.3f" % (brier_over(preds), brier_u35(preds)))
 
     if market:
         pm = [p for p in preds if all(k in p["m"]["avg"] for k in ("1", "X", "2"))]
@@ -218,24 +269,20 @@ def summarize(preds, title, market):
             L.append("  miglior mix: %d%% mercato" % (best[0] * 100))
         po = [p for p in preds if "O2.5" in p["m"]["avg"] and "U2.5" in p["m"]["avg"]]
         if len(po) >= 30:
-            def y(p):
-                return 1.0 if p["m"]["hg"] + p["m"]["ag"] >= 3 else 0.0
             qs = [devig([p["m"]["avg"]["O2.5"], p["m"]["avg"]["U2.5"]])[0] for p in po]
-            b_mod = _mean([(p["probs"]["O2.5"] - y(p)) ** 2 for p in po])
-            b_mkt = _mean([(q - y(p)) ** 2 for p, q in zip(po, qs)])
+            b_mod = _mean([(p["probs"]["O2.5"] - (1.0 if total(p) >= 3 else 0.0)) ** 2 for p in po])
+            b_mkt = _mean([(q - (1.0 if total(p) >= 3 else 0.0)) ** 2 for p, q in zip(po, qs)])
             L.append("Over 2.5 (Brier): modello %.3f | mercato %.3f" % (b_mod, b_mkt))
 
-    # 2) calibrazione
     L.append("Calibrazione (previsto -> reale):")
     for key, name in (("1", "Vittoria casa"), ("X", "Pareggio"), ("2", "Vittoria ospite"),
                       ("O2.5", "Over 2.5"), ("U3.5", "Under 3.5"), ("GG", "Gol")):
         pairs = [(p["probs"][key], outcomes(p["m"]["hg"], p["m"]["ag"])[key]) for p in preds]
         L += calib_line(name, pairs)
 
-    # 3) giocate del bot (stessa regola del report)
     safe_l, bold_l = [], []
     for p in preds:
-        mis = vb.is_mismatch(p["xg"])
+        mis = vb.is_mismatch(p["xg"], kind)
         probs = p["probs"]
         if mis:
             probs = {k: v for k, v in probs.items() if k not in vb.UNDER_KEYS}
@@ -253,17 +300,14 @@ def summarize(preds, title, market):
             L.append(t)
     L.append("  partite con una SICURA: %d su %d" % (len(safe_l), len(preds)))
 
-    # 4) partite squilibrate
-    mm = [p for p in preds if vb.is_mismatch(p["xg"])]
+    mm = [p for p in preds if vb.is_mismatch(p["xg"], kind)]
     if len(mm) >= 15:
-        goals = _mean([p["m"]["hg"] + p["m"]["ag"] for p in mm])
-        xgs = _mean([p["xg"][0] + p["xg"][1] for p in mm])
-        u35p = _mean([p["probs"]["U3.5"] for p in mm])
-        u35r = _mean([1.0 if p["m"]["hg"] + p["m"]["ag"] <= 3 else 0.0 for p in mm])
-        L.append("Partite squilibrate (%d): gol attesi %.2f, gol veri %.2f | Under 3.5 previsto %.0f%%, reale %.0f%%" % (
-            len(mm), xgs, goals, u35p * 100, u35r * 100))
+        L.append("Partite segnalate come squilibrate (%d): gol attesi %.2f, gol veri %.2f | Under 3.5 previsto %.0f%%, reale %.0f%%" % (
+            len(mm), _mean([p["xg"][0] + p["xg"][1] for p in mm]), _mean([total(p) for p in mm]),
+            100 * _mean([p["probs"]["U3.5"] for p in mm]),
+            100 * _mean([1.0 if total(p) <= 3 else 0.0 for p in mm])))
+    L += xg_buckets(preds)
 
-    # 5) value bet storiche e riferimento
     if market:
         bets = []
         for p in preds:
@@ -272,10 +316,10 @@ def summarize(preds, title, market):
                 pr = p["probs"][key]
                 edge = pr * o - 1
                 if 0.30 <= pr and 0.05 <= edge <= 0.40:
-                    bets.append((o, out[key], key))
+                    bets.append((o, out[key]))
         if bets:
-            profit = sum((o - 1) if hit else -1 for o, hit, _ in bets)
-            hits = sum(1 for _, hit, _ in bets if hit)
+            profit = sum((o - 1) if hit else -1 for o, hit in bets)
+            hits = sum(1 for _, hit in bets if hit)
             L.append("Value bet (valore >= 5%%, quota massima): %d giocate, %d azzeccate (%.0f%%), resa %+.1f%%" % (
                 len(bets), hits, 100.0 * hits / len(bets), 100.0 * profit / len(bets)))
         blind = []
@@ -291,76 +335,149 @@ def summarize(preds, title, market):
     return L
 
 
-# ----------------------------- GRIGLIA PARAMETRI ------------------------
-def run_club(data, today, half_life, shrink, refit_days=REFIT_DAYS):
-    test_from = today - timedelta(days=TEST_DAYS)
-    preds = []
-    for div, ms in data.items():
-        preds += walk_forward(ms, half_life, shrink, TRAIN_DAYS, refit_days,
-                              vb.MIN_W_CLUB, test_from, today)
-    return preds
+# ----------------------------- TARATURA ---------------------------------
+def pick_guard(preds):
+    """Soglia di gol attesi della favorita oltre la quale l'Under 3.5 e' sopravvalutato
+    di almeno 4 punti. Se non c'e' nessuna soglia, la guardia e' inutile (99)."""
+    t = 1.5
+    while t <= 4.0:
+        sel = [p for p in preds if max(p["xg"]) >= t]
+        if len(sel) >= 40:
+            gap = _mean([p["probs"]["U3.5"] for p in sel]) - \
+                _mean([1.0 if total(p) <= 3 else 0.0 for p in sel])
+            if gap >= 0.04:
+                return t
+        t += 0.25
+    return 99.0
 
 
-def run_grid(data, today):
-    L = ["", "== PROVA DI PARAMETRI (club, ogni riga e' un esperimento) =="]
-    L.append("Brier 1X2 e Over 2.5: piu' basso = meglio")
+def tune(label, runner, base, spreads, extra=None):
+    """runner(hl, sh, spread) -> preds. Ritorna (miglior combinazione, righe di testo)."""
+    L = []
     res = []
-    for hl in (120, 240, 480):
-        for sh in (2.0, 4.0, 8.0):
-            pr = run_club(data, today, hl, sh, refit_days=14)
-            res.append((brier_1x2(pr), brier_over(pr), hl, sh, len(pr)))
-            print("  provato emivita %d, smorzamento %.0f" % (hl, sh))
+    for hl, sh in base:
+        pr = runner(hl, sh, 0.0)
+        res.append((objective(pr), hl, sh))
+        print("  %s: emivita %d, smorzamento %s" % (label, hl, sh))
     res.sort()
-    for b1, bo, hl, sh, n in res:
-        mark = "  <- attuale" if (hl, sh) == (vb.HALF_LIFE_CLUB, vb.SHRINK_CLUB) else ""
-        L.append("  emivita %3d gg, smorzamento %.0f: 1X2 %.4f | Over %.4f (n=%d)%s" % (hl, sh, b1, bo, n, mark))
-    best_hl, best_sh = res[0][2], res[0][3]
-    L.append("Miglior combinazione: emivita %d giorni, smorzamento %.0f" % (best_hl, best_sh))
-    old_rho = vb.DC_RHO
-    rr = []
+    _, hl, sh = res[0]
+    best_spread, best_obj = 0.0, res[0][0]
+    for sp in spreads:
+        pr = runner(hl, sh, sp)
+        o = objective(pr)
+        print("  %s: incertezza %.2f" % (label, sp))
+        if o < best_obj:
+            best_spread, best_obj = sp, o
+    L.append("  emivita %d giorni, smorzamento %s, incertezza gol %.2f" % (hl, sh, best_spread))
+    return (hl, sh, best_spread), L
+
+
+def tune_club(data, today):
+    cur = run_club(data, today, vb.HALF_LIFE_CLUB, vb.SHRINK_CLUB, TUNE_REFIT_CLUB, vb.SPREAD_CLUB)
+    L = ["", "== TARATURA CLUB =="]
+    L.append("Prima: " + metrics_line(cur))
+    base = [(hl, sh) for hl in (120, 240, 480) for sh in (2.0, 4.0, 8.0)]
+    (hl, sh, sp), t = tune("club", lambda h, s, x: run_club(data, today, h, s, TUNE_REFIT_CLUB, x),
+                           base, (0.10, 0.20, 0.30))
+    best_rho, best_o = vb.DC_RHO, None
     for rho in (-0.20, -0.10, -0.05, 0.0):
         vb.DC_RHO = rho
-        pr = run_club(data, today, best_hl, best_sh, refit_days=14)
-        rr.append((brier_over(pr), brier_1x2(pr), rho))
-        print("  provato rho %.2f" % rho)
-    vb.DC_RHO = old_rho
-    rr.sort()
-    L.append("Correzione punteggi bassi (rho), con la combinazione migliore:")
-    for bo, b1, rho in rr:
-        mark = "  <- attuale" if rho == old_rho else ""
-        L.append("  rho %+.2f: Over %.4f | 1X2 %.4f%s" % (rho, bo, b1, mark))
-    return L
+        o = objective(run_club(data, today, hl, sh, TUNE_REFIT_CLUB, sp))
+        print("  club: rho %.2f" % rho)
+        if best_o is None or o < best_o:
+            best_rho, best_o = rho, o
+    vb.DC_RHO = best_rho
+    after = run_club(data, today, hl, sh, TUNE_REFIT_CLUB, sp)
+    L.append("Dopo:  " + metrics_line(after))
+    L += t
+    L.append("  correzione punteggi bassi (rho) %.2f" % best_rho)
+    params = {"half_life_club": hl, "shrink_club": sh, "spread_club": sp, "dc_rho": best_rho}
+    vb.HALF_LIFE_CLUB, vb.SHRINK_CLUB, vb.SPREAD_CLUB = hl, sh, sp
+    vb.DC_RHO = best_rho
+    return params, L
+
+
+def tune_intl(ms, today):
+    cur = run_intl(ms, today, vb.HALF_LIFE_INTL, vb.SHRINK_INTL, TUNE_REFIT_INTL, vb.SPREAD_INTL)
+    L = ["", "== TARATURA NAZIONALI =="]
+    L.append("Prima: " + metrics_line(cur))
+    base = [(hl, sh) for hl in (180, 365, 730) for sh in (0.5, 1.0, 2.0, 3.0)]
+    (hl, sh, sp), t = tune("nazionali", lambda h, s, x: run_intl(ms, today, h, s, TUNE_REFIT_INTL, x),
+                           base, (0.15, 0.30, 0.45))
+    after = run_intl(ms, today, hl, sh, TUNE_REFIT_INTL, sp)
+    L.append("Dopo:  " + metrics_line(after))
+    L += t
+    vb.HALF_LIFE_INTL, vb.SHRINK_INTL, vb.SPREAD_INTL = hl, sh, sp
+    return {"half_life_intl": hl, "shrink_intl": sh, "spread_intl": sp}, L
+
+
+def save_params(params):
+    os.makedirs(os.path.dirname(vb.PARAMS_FILE), exist_ok=True)
+    params["tuned_on"] = date.today().isoformat()
+    with open(vb.PARAMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(params, f, indent=1)
 
 
 # ----------------------------- MAIN -------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--grid", action="store_true")
+    ap.add_argument("--tune", action="store_true")
     ap.add_argument("--no-intl", action="store_true")
     ap.add_argument("--no-club", action="store_true")
     args, _ = ap.parse_known_args()
     today = date.today()
-    L = ["BACKTEST del %s (misura su circa %d giorni di partite gia' giocate)" % (
-        today.strftime("%d/%m/%Y"), TEST_DAYS)]
+    head = "TARATURA E BACKTEST DELL'ORACOLO" if args.tune else "BACKTEST DELL'ORACOLO"
+    L = ["%s del %s (misura su circa %d giorni di partite gia' giocate)" % (
+        head, today.strftime("%d/%m/%Y"), TEST_DAYS)]
+    params = {"mismatch_ratio": 99.0}
+    tuned_any = False
 
+    club_data = intl_ms = None
     if not args.no_club:
         print("Scarico lo storico dei club...")
-        data = load_club(today)
-        print("Calcolo il backtest dei club...")
-        preds = run_club(data, today, vb.HALF_LIFE_CLUB, vb.SHRINK_CLUB)
-        L += summarize(preds, "CLUB (5 campionati)", True)
-        if args.grid:
-            L += run_grid(data, today)
-
+        club_data = load_club(today)
     if not args.no_intl:
         print("Scarico lo storico delle nazionali...")
-        ms = load_intl(today)
-        print("Calcolo il backtest delle nazionali...")
-        preds = walk_forward(ms, vb.HALF_LIFE_INTL, vb.SHRINK_INTL, INTL_TRAIN_DAYS,
-                             INTL_REFIT_DAYS, vb.MIN_W_INTL,
-                             today - timedelta(days=TEST_DAYS), today)
-        L += summarize(preds, "NAZIONALI", False)
+        intl_ms = load_intl(today)
 
+    if args.tune:
+        if club_data is not None:
+            p, t = tune_club(club_data, today)
+            params.update(p)
+            L += t
+            tuned_any = True
+        if intl_ms is not None:
+            p, t = tune_intl(intl_ms, today)
+            params.update(p)
+            L += t
+            tuned_any = True
+
+    if club_data is not None:
+        print("Calcolo il backtest dei club...")
+        preds = run_club(club_data, today, vb.HALF_LIFE_CLUB, vb.SHRINK_CLUB, REFIT_DAYS, vb.SPREAD_CLUB)
+        if args.tune:
+            g = pick_guard(preds)
+            params["mismatch_xg_club"] = g
+            vb.MISMATCH_XG_CLUB, vb.MISMATCH_RATIO = g, 99.0
+            L += ["", "Guardia partite squilibrate (club): " +
+                  ("serve dalla soglia %.2f gol attesi" % g if g < 99 else "non serve, tolta")]
+        L += summarize(preds, "CLUB (5 campionati)", True, "club")
+
+    if intl_ms is not None:
+        print("Calcolo il backtest delle nazionali...")
+        preds = run_intl(intl_ms, today, vb.HALF_LIFE_INTL, vb.SHRINK_INTL, INTL_REFIT_DAYS, vb.SPREAD_INTL)
+        if args.tune:
+            g = pick_guard(preds)
+            params["mismatch_xg_intl"] = g
+            vb.MISMATCH_XG_INTL, vb.MISMATCH_RATIO = g, 99.0
+            L += ["", "Guardia partite squilibrate (nazionali): " +
+                  ("serve dalla soglia %.2f gol attesi" % g if g < 99 else "non serve, tolta")]
+        L += summarize(preds, "NAZIONALI", False, "intl")
+
+    if args.tune and tuned_any:
+        save_params(params)
+        L += ["", "Parametri salvati in data/params.json: l'Oracolo li usera' dalla prossima analisi "
+              "(per tornare indietro basta cancellare quel file)."]
     L += ["", "Come leggerlo: se 'previsto' e 'reale' sono vicini il modello e' affidabile; "
           "se il modello e' peggiore del mercato conviene correggerlo con le quote."]
     print("\n" + "\n".join(L))
