@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Genera la pagina web con il tasto "Analizza ora" e salva l'ultimo risultato.
+"""L'Oracolo: genera la pagina web con il tasto e salva l'ultimo risultato.
 
-- site/index.html  : pagina con il tasto (pubblicata su GitHub Pages)
-- data/latest.json : ultimo report (la pagina lo legge per mostrarti il risultato)
+- site/index.html  : la pagina (pubblicata su GitHub Pages)
+- data/latest.json : ultimo risultato (la pagina lo legge quando premi il tasto)
 Lanciato da GitHub Actions, ma funziona anche a mano: python build_site.py --days 1
 """
 import argparse
-import html
 import json
 import os
 import traceback
@@ -16,61 +15,270 @@ from datetime import date, datetime, timedelta
 import storico
 import value_bet as vb
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="it"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Consigli del giorno</title>
+<meta name="apple-mobile-web-app-title" content="L’Oracolo">
+<title>L’Oracolo</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🔮%3C/text%3E%3C/svg%3E">
 <style>
-:root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--card:#f3f4f6;--acc:#0a7d3b;--mut:#6b7280}
-@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--card:#1d1f23;--acc:#4ade80;--mut:#9ca3af}}
+:root{color-scheme:light dark;--bg:#f6f7f9;--fg:#15171a;--card:#fff;--line:#e4e7ec;--mut:#667085;
+--acc:#6d28d9;--acc2:#8b5cf6;--hi:#16a34a;--mid:#d97706;--lo:#64748b;--bad:#dc2626;--soft:#f1edfd}
+@media (prefers-color-scheme:dark){:root{--bg:#0e0f13;--fg:#eceef2;--card:#171a20;--line:#272b33;--mut:#9aa3b2;
+--acc:#a78bfa;--acc2:#7c3aed;--hi:#4ade80;--mid:#fbbf24;--lo:#94a3b8;--bad:#f87171;--soft:#211a3a}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 -apple-system,system-ui,sans-serif;
-padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom))}
-h1{font-size:1.3rem;margin:.2rem 0 .8rem}
-.row{display:flex;gap:10px;align-items:stretch;margin-bottom:10px}
-.btn{flex:1;border:0;border-radius:12px;padding:14px 16px;font-size:1.05rem;font-weight:700;
-background:var(--acc);color:#fff}
-.btn:disabled{opacity:.55}
-.btn.small{flex:none;padding:8px 14px;font-size:.95rem}
-.btn.sec{background:var(--card);color:var(--fg)}
-select,input{font-size:1rem;border-radius:10px;border:1px solid var(--mut);padding:10px;
-background:var(--card);color:var(--fg)}
+padding:max(14px,env(safe-area-inset-top)) 14px max(28px,env(safe-area-inset-bottom));max-width:720px;margin-inline:auto}
+.hidden{display:none!important}
+header{display:flex;align-items:center;gap:12px;margin:6px 0 14px}
+.orb{font-size:2rem;width:52px;height:52px;border-radius:16px;display:grid;place-items:center;
+background:linear-gradient(135deg,var(--acc2),var(--acc));box-shadow:0 6px 18px rgba(109,40,217,.35)}
+h1{font-size:1.45rem;margin:0;letter-spacing:-.01em}
+.sub{color:var(--mut);font-size:.88rem}
+h2{font-size:1.02rem;margin:22px 0 8px}
+.actions{display:flex;gap:10px}
+.btn{flex:1;border:0;border-radius:14px;padding:15px 16px;font-size:1.05rem;font-weight:700;color:#fff;
+background:linear-gradient(135deg,var(--acc2),var(--acc))}
+.btn:disabled{opacity:.6}
+.btn.small{flex:none;padding:9px 14px;font-size:.95rem}
+.btn.sec{background:var(--card);color:var(--fg);border:1px solid var(--line)}
+select,input{font-size:1rem;border-radius:12px;border:1px solid var(--line);padding:10px;background:var(--card);color:var(--fg)}
 input{width:100%;margin:6px 0}
-.upd{color:var(--mut);font-size:.88rem;margin:4px 0 10px}
-pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);padding:14px;border-radius:12px;
-font:14px/1.5 ui-monospace,Menlo,monospace}
-details{margin-top:18px;color:var(--mut);font-size:.92rem}
+.upd{color:var(--mut);font-size:.85rem;margin:8px 2px 0}
+.flash{animation:flash 1.6s ease-out}
+@keyframes flash{0%{color:var(--hi);font-weight:700}100%{color:var(--mut)}}
+.progress{margin-top:12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.pbar{height:8px;border-radius:99px;background:var(--line);overflow:hidden}
+.pbar i{display:block;height:100%;width:4%;border-radius:99px;background:linear-gradient(90deg,var(--acc2),var(--acc));transition:width .8s ease}
+.pstep{font-size:.88rem;color:var(--mut);margin-top:8px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 8px;text-align:center}
+.tile b{display:block;font-size:1.35rem}
+.tile span{font-size:.75rem;color:var(--mut)}
+.toprow{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);
+border-left:5px solid var(--lo);border-radius:14px;padding:11px 12px;margin-bottom:8px}
+.toprow.hi{border-left-color:var(--hi)}.toprow.mid{border-left-color:var(--mid)}
+.rank{width:26px;height:26px;border-radius:50%;background:var(--soft);color:var(--acc);display:grid;place-items:center;font-weight:700;font-size:.85rem;flex:none}
+.tmid{flex:1;min-width:0}
+.teams{font-weight:650;overflow-wrap:anywhere}
+.meta{font-size:.8rem;color:var(--mut)}
+.lab{font-size:.9rem;margin-top:2px}
+.right{text-align:right;flex:none}
+.bigpct{font-size:1.3rem;font-weight:800}
+.min{font-size:.75rem;color:var(--mut)}
+.hint{font-size:.86rem;color:var(--mut);margin:-2px 0 8px}
+.combogrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.combo{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 6px;text-align:center}
+.combo.warn{border-color:var(--bad)}
+.cn{font-size:.78rem;color:var(--mut)}.cp{font-size:1.25rem;font-weight:800}.cm{font-size:.74rem;color:var(--mut)}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 8px;margin-top:6px;-webkit-overflow-scrolling:touch}
+.chip{flex:none;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:99px;padding:7px 13px;font-size:.88rem}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.match{background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:8px;overflow:hidden}
+.msum{list-style:none;display:flex;align-items:center;gap:10px;padding:12px;cursor:pointer}
+.msum::-webkit-details-marker{display:none}
+.ml{flex:1;min-width:0}
+.pill{flex:none;font-weight:800;font-size:.95rem;padding:5px 10px;border-radius:99px;background:var(--soft);color:var(--lo)}
+.pill.hi{color:var(--hi)}.pill.mid{color:var(--mid)}.pill.none{font-weight:600;font-size:.82rem}
+.mbody{padding:0 12px 12px;border-top:1px solid var(--line)}
+.xg{font-size:.85rem;color:var(--mut);margin:10px 0 4px}
+.tagw{display:inline-block;font-size:.78rem;background:var(--soft);color:var(--acc);border-radius:8px;padding:3px 8px;margin:2px 0 6px}
+.note{font-size:.86rem;margin:3px 0}
+.pick{margin-top:10px;padding:10px;border-radius:12px;background:var(--bg)}
+.pick-top{display:flex;align-items:baseline;gap:8px}
+.tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--acc);font-weight:700;flex:none}
+.pick-label{font-weight:650;flex:1}
+.pick-pct{font-weight:800}
+.meter{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin:8px 0 6px}
+.meter i{display:block;height:100%;border-radius:99px;background:var(--lo)}
+.pick.hi .meter i{background:var(--hi)}.pick.mid .meter i{background:var(--mid)}
+.pick-sub{font-size:.84rem;color:var(--mut)}
+.badge{display:inline-block;margin-top:6px;font-size:.78rem;font-weight:650;border-radius:8px;padding:3px 8px}
+.badge.ok{background:rgba(22,163,74,.15);color:var(--hi)}.badge.bad{background:rgba(220,38,38,.14);color:var(--bad)}
+.props{margin-top:10px;font-size:.86rem}.ptitle{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:700}
+.pline{margin:3px 0}
+.empty{color:var(--mut);font-size:.92rem;padding:8px 2px}
+pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px solid var(--line);padding:14px;border-radius:12px;font:13px/1.5 ui-monospace,Menlo,monospace}
+details.box{margin-top:16px;color:var(--mut);font-size:.92rem}
+details.box summary{cursor:pointer;font-weight:600}
+.foot{margin-top:22px;font-size:.78rem;color:var(--mut)}
 </style></head><body>
-<h1>Consigli del giorno</h1>
-<div class="row">
-  <button id="go" class="btn">▶ Analizza ora</button>
-  <select id="days" aria-label="Giorni"><option value="1">Oggi</option>
-  <option value="2">2 giorni</option><option value="3">3 giorni</option></select>
+<header><div class="orb">🔮</div><div><h1>L’Oracolo</h1><div class="sub">Consigli sul calcio, calcolati dai dati</div></div></header>
+<div class="actions">
+  <button id="go" class="btn">▶ Chiedi all’Oracolo</button>
+  <select id="days" aria-label="Giorni"><option value="1">Oggi</option><option value="2">2 giorni</option><option value="3">3 giorni</option></select>
 </div>
-<div id="status" class="upd">Ultimo aggiornamento: __UPDATED__</div>
-<pre id="out">__REPORT__</pre>
-<details id="hist"><summary>Storico e precisione</summary>
-  <pre id="stats">__STATS__</pre>
-</details>
-<details id="settings"><summary>Impostazioni</summary>
-  <p>Per avviare l’analisi da questa pagina serve un token GitHub. Resta salvato solo
-  su questo telefono, non nel repository.</p>
+<div id="progress" class="progress hidden"><div class="pbar"><i id="pfill"></i></div><div id="pstep" class="pstep"></div></div>
+<div id="status" class="upd"></div>
+<div id="app" class="hidden">
+  <div id="tiles" class="tiles"></div>
+  <section id="top"></section>
+  <section id="combos"></section>
+  <h2>Le partite</h2>
+  <div id="chips" class="chips"></div>
+  <section id="matches"></section>
+  <div id="gnotes" class="hint"></div>
+</div>
+<pre id="out" class="hidden"></pre>
+<details class="box"><summary>Storico e precisione</summary><pre id="stats"></pre></details>
+<details class="box" id="settings"><summary>Impostazioni</summary>
+  <p>Per avviare l’analisi da questa pagina serve un token GitHub. Resta salvato solo su questo telefono, non nel repository.</p>
   <input id="tok" type="password" placeholder="Incolla qui il token" autocomplete="off">
-  <div class="row"><button id="save" class="btn small">Salva</button>
-  <button id="clear" class="btn small sec">Cancella</button></div>
+  <div class="actions"><button id="save" class="btn small">Salva</button><button id="clear" class="btn small sec">Cancella</button></div>
   <div id="tokstate"></div>
 </details>
+<div class="foot">Le percentuali sono stime di un modello statistico, non certezze. Le quote dei bookmaker incorporano commissioni: gioca solo se la quota reale è almeno quella minima indicata, e con moderazione.</div>
+<script type="application/json" id="boot">__BOOT__</script>
 <script>
 const owner = location.hostname.split(".")[0];
 const repo = location.pathname.split("/")[1] || "";
 const API = "https://api.github.com/repos/" + owner + "/" + repo;
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+};
+const pct = (p) => Math.round(p * 100) + "%";
+const conf = (p) => (p >= 0.75 ? "hi" : p >= 0.66 ? "mid" : "lo");
+let activeLeague = "Tutte";
 
 function getToken() { try { return localStorage.getItem("gh_token") || ""; } catch (e) { return ""; } }
 function setToken(t) { try { if (t) localStorage.setItem("gh_token", t); else localStorage.removeItem("gh_token"); } catch (e) {} }
-function status(msg) { $("status").textContent = msg; }
+function setStatus(msg, flash) {
+  const s = $("status");
+  s.textContent = msg;
+  s.classList.remove("flash");
+  if (flash) { void s.offsetWidth; s.classList.add("flash"); }
+}
 function tokState() { $("tokstate").textContent = getToken() ? "Token salvato." : "Nessun token salvato."; }
+
+function pickBox(tag, pick) {
+  const box = el("div", "pick " + conf(pick.prob));
+  const top = el("div", "pick-top");
+  top.append(el("span", "tag", tag), el("span", "pick-label", pick.label), el("span", "pick-pct", pct(pick.prob)));
+  const meter = el("div", "meter");
+  const fill = el("i");
+  fill.style.width = Math.round(pick.prob * 100) + "%";
+  meter.append(fill);
+  box.append(top, meter, el("div", "pick-sub", "Gioca solo se la quota è almeno " + pick.minodds.toFixed(2)));
+  if (pick.odds) {
+    box.append(el("div", "badge " + (pick.ok ? "ok" : "bad"),
+      "Quota trovata " + pick.odds.toFixed(2) + " (" + pick.book + "): " + (pick.ok ? "conviene" : "troppo bassa")));
+  }
+  return box;
+}
+
+function matchCard(m, open) {
+  const det = el("details", "match");
+  det.open = open;
+  const sum = el("summary", "msum");
+  const left = el("div", "ml");
+  left.append(el("div", "teams", m.home + " – " + m.away));
+  left.append(el("div", "meta", m.league + (m.time ? " · " + m.time : "")));
+  sum.append(left);
+  sum.append(m.safe ? el("div", "pill " + conf(m.safe.prob), pct(m.safe.prob)) : el("div", "pill none", "salta"));
+  det.append(sum);
+  const body = el("div", "mbody");
+  body.append(el("div", "xg", "Gol attesi " + m.xg[0].toFixed(1) + " – " + m.xg[1].toFixed(1)));
+  if (m.mismatch) body.append(el("div", "tagw", "Partita squilibrata: niente Under"));
+  (m.notes || []).forEach((n) => body.append(el("div", "note", n)));
+  body.append(m.safe ? pickBox("Sicura", m.safe) : el("div", "empty", "Partita incerta: nessuna giocata abbastanza solida."));
+  if (m.bold) body.append(pickBox("Più quota", m.bold));
+  if (m.props && m.props.length) {
+    const p = el("div", "props");
+    p.append(el("div", "ptitle", "Cartellini e tiri in porta"));
+    m.props.forEach((x) => p.append(el("div", "pline", x)));
+    body.append(p);
+  }
+  det.append(body);
+  return det;
+}
+
+function renderTiles(v) {
+  const t = $("tiles");
+  t.textContent = "";
+  const solid = v.matches.filter((m) => m.safe).length;
+  [[String(v.matches.length), "partite"], [String(solid), "giocate solide"], [v.date || "", "data"]].forEach((x) => {
+    const c = el("div", "tile");
+    c.append(el("b", null, x[0]), el("span", null, x[1]));
+    t.append(c);
+  });
+}
+
+function renderTop(v) {
+  const box = $("top");
+  box.textContent = "";
+  box.append(el("h2", null, "Le migliori giocate"));
+  if (!v.top.length) { box.append(el("div", "empty", "Nessuna giocata abbastanza solida oggi: meglio saltare.")); return; }
+  v.top.forEach((t, i) => {
+    const row = el("div", "toprow " + conf(t.prob));
+    row.append(el("div", "rank", String(i + 1)));
+    const mid = el("div", "tmid");
+    mid.append(el("div", "teams", t.home + " – " + t.away));
+    mid.append(el("div", "meta", t.league + (t.time ? " · " + t.time : "")));
+    mid.append(el("div", "lab", t.label));
+    row.append(mid);
+    const right = el("div", "right");
+    right.append(el("div", "bigpct", pct(t.prob)), el("div", "min", "quota min " + t.minodds.toFixed(2)));
+    row.append(right);
+    box.append(row);
+  });
+}
+
+function renderCombos(v) {
+  const box = $("combos");
+  box.textContent = "";
+  if (!v.combos || !v.combos.length) return;
+  box.append(el("h2", null, "Se vuoi combinarle"));
+  box.append(el("div", "hint", "Meglio singole o al massimo doppie: più gambe metti, meno probabilità hai di passare."));
+  const grid = el("div", "combogrid");
+  v.combos.forEach((c) => {
+    const card = el("div", "combo" + (c.prob < 0.4 ? " warn" : ""));
+    card.append(el("div", "cn", c.n + " insieme"), el("div", "cp", pct(c.prob)), el("div", "cm", "quota min " + c.minodds.toFixed(2)));
+    grid.append(card);
+  });
+  box.append(grid);
+}
+
+function renderMatches(v) {
+  const box = $("matches");
+  box.textContent = "";
+  const list = v.matches.filter((m) => activeLeague === "Tutte" || m.league === activeLeague);
+  if (!list.length) { box.append(el("div", "empty", "Nessuna partita in questo periodo.")); return; }
+  list.forEach((m) => box.append(matchCard(m, list.length <= 3)));
+}
+
+function renderChips(v) {
+  const box = $("chips");
+  box.textContent = "";
+  const leagues = ["Tutte"].concat(Array.from(new Set(v.matches.map((m) => m.league))));
+  if (leagues.length <= 2) return;
+  leagues.forEach((l) => {
+    const c = el("button", "chip" + (l === activeLeague ? " on" : ""), l);
+    c.type = "button";
+    c.addEventListener("click", () => { activeLeague = l; renderChips(v); renderMatches(v); });
+    box.append(c);
+  });
+}
+
+function render(d, flash) {
+  const v = d.view;
+  const structured = !!(v && v.matches && v.top);
+  setStatus(d.updated ? "Aggiornato: " + d.updated : "", flash);
+  $("app").classList.toggle("hidden", !structured);
+  $("out").classList.toggle("hidden", structured);
+  if (structured) {
+    if (activeLeague !== "Tutte" && !v.matches.some((m) => m.league === activeLeague)) activeLeague = "Tutte";
+    renderTiles(v); renderTop(v); renderCombos(v); renderChips(v); renderMatches(v);
+    $("gnotes").textContent = (v.notes || []).join(" ");
+  } else {
+    $("out").textContent = d.report || "";
+  }
+  if (d.stats) $("stats").textContent = d.stats;
+}
 
 async function getLatest() {
   const url = API + "/contents/data/latest.json?ref=main&t=" + Date.now();
@@ -82,57 +290,56 @@ async function getLatest() {
   return await r.json();
 }
 
-function show(d) {
-  $("out").textContent = d.report;
-  if (d.stats) $("stats").textContent = d.stats;
-  status("Aggiornato: " + d.updated);
+function progress(sec) {
+  const steps = [[8, "Sveglio i server…"], [25, "Scarico dati e quote…"], [55, "Calcolo le probabilità…"], [999, "Preparo i consigli…"]];
+  $("pfill").style.width = Math.min(94, Math.round(100 * (1 - Math.exp(-sec / 38)))) + "%";
+  $("pstep").textContent = steps.find((s) => sec < s[0])[1] + " (" + sec + " s)";
 }
 
 async function run() {
   const tok = getToken();
-  if (!tok) {
-    $("settings").open = true;
-    status("Prima salva il token nelle Impostazioni.");
-    return;
-  }
+  if (!tok) { $("settings").open = true; setStatus("Prima salva il token nelle Impostazioni."); return; }
   $("go").disabled = true;
-  status("Avvio dell’analisi…");
+  setStatus("Avvio dell’analisi…");
   let before = null;
   try { before = (await getLatest()).run_id; } catch (e) {}
   try {
     const r = await fetch(API + "/actions/workflows/report.yml/dispatches", {
       method: "POST",
-      headers: {
-        "Accept": "application/vnd.github+json",
-        "Authorization": "Bearer " + tok,
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json"
-      },
+      headers: { "Accept": "application/vnd.github+json", "Authorization": "Bearer " + tok,
+                 "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
       body: JSON.stringify({ ref: "main", inputs: { days: $("days").value } })
     });
     if (r.status !== 204) {
-      status(r.status === 401 || r.status === 403 || r.status === 404
+      setStatus(r.status === 401 || r.status === 403 || r.status === 404
         ? "Token non valido o senza permesso Actions (errore " + r.status + ")."
         : "Avvio non riuscito (errore " + r.status + ").");
       $("go").disabled = false;
       return;
     }
-  } catch (e) {
-    status("Errore di rete: " + e.message);
-    $("go").disabled = false;
-    return;
-  }
-  status("Analisi in corso, circa 1 minuto…");
+  } catch (e) { setStatus("Errore di rete: " + e.message); $("go").disabled = false; return; }
+  setStatus("");
+  $("progress").classList.remove("hidden");
   const start = Date.now();
+  progress(0);
   while (Date.now() - start < 240000) {
-    await sleep(6000);
+    await sleep(3000);
+    progress(Math.round((Date.now() - start) / 1000));
     try {
       const d = await getLatest();
-      if (d.run_id !== before) { show(d); $("go").disabled = false; return; }
+      if (d.run_id !== before) {
+        $("pfill").style.width = "100%";
+        await sleep(400);
+        $("progress").classList.add("hidden");
+        render(d, true);
+        $("go").disabled = false;
+        window.scrollTo({ top: 0, behavior: "smooth" });
+        return;
+      }
     } catch (e) {}
-    status("Analisi in corso… " + Math.round((Date.now() - start) / 1000) + " s");
   }
-  status("Ci sta mettendo troppo: controlla la scheda Actions su GitHub.");
+  $("progress").classList.add("hidden");
+  setStatus("Ci sta mettendo troppo: controlla la scheda Actions su GitHub.");
   $("go").disabled = false;
 }
 
@@ -140,7 +347,8 @@ $("go").addEventListener("click", run);
 $("save").addEventListener("click", () => { setToken($("tok").value.trim()); $("tok").value = ""; tokState(); });
 $("clear").addEventListener("click", () => { setToken(""); tokState(); });
 tokState();
-getLatest().then(show).catch(() => {});
+try { render(JSON.parse($("boot").textContent), false); } catch (e) {}
+getLatest().then((d) => render(d, false)).catch(() => {});
 </script>
 </body></html>"""
 
@@ -163,7 +371,7 @@ def notify(text, click):
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
         return
-    headers = {"Title": "Consigli del giorno"}
+    headers = {"Title": "L'Oracolo - consigli del giorno"}   # solo ASCII negli header
     if click:
         headers["Click"] = click
     try:
@@ -185,11 +393,13 @@ def main():
 
     today = date.today()
     last = today + timedelta(days=max(args.days, 1) - 1)
-    sink = []
+    sink, view = [], {}
     try:
-        report = vb.build_report(today, last, not args.no_club, not args.no_intl, sink=sink)
+        report = vb.build_report(today, last, not args.no_club, not args.no_intl,
+                                 sink=sink, view=view)
     except Exception:
         report = "ERRORE durante l'esecuzione:\n\n" + traceback.format_exc()
+        view = {}
 
     # storico: verifica le previsioni passate, salva le nuove, calcola la precisione
     try:
@@ -206,15 +416,16 @@ def main():
     updated = datetime.now().strftime("%d/%m/%Y %H:%M")
     run_id = "%s-%s" % (os.environ.get("GITHUB_RUN_ID", "locale"),
                         os.environ.get("GITHUB_RUN_ATTEMPT", datetime.now().strftime("%H%M%S")))
+    latest = {"run_id": run_id, "updated": updated, "report": report, "stats": stats, "view": view}
 
     os.makedirs("site", exist_ok=True)
     os.makedirs("data", exist_ok=True)
-    page = PAGE.replace("__UPDATED__", html.escape(updated)).replace("__REPORT__", html.escape(report)).replace("__STATS__", html.escape(stats))
+    boot = json.dumps({"updated": updated, "report": report, "stats": stats, "view": view},
+                      ensure_ascii=False).replace("<", "\\u003c")
     with open("site/index.html", "w", encoding="utf-8") as f:
-        f.write(page)
+        f.write(PAGE.replace("__BOOT__", boot))
     with open("data/latest.json", "w", encoding="utf-8") as f:
-        json.dump({"run_id": run_id, "updated": updated, "report": report, "stats": stats},
-                  f, ensure_ascii=False)
+        json.dump(latest, f, ensure_ascii=False)
     print(report)
 
     if not report.startswith("ERRORE") and os.environ.get("EVENT") != "push":
