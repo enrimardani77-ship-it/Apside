@@ -1,0 +1,14 @@
+{
+ "mismatch_ratio": 99.0,
+ "half_life_club": 480,
+ "shrink_club": 8.0,
+ "spread_club": 0.1,
+ "dc_rho": -0.05,
+ "half_life_intl": 730,
+ "shrink_intl": 0.5,
+ "spread_intl": 0.45,
+ "mismatch_xg_club": 99.0,
+ "market_w": 1.0,
+ "mismatch_xg_intl": 99.0,
+ "tuned_on": "2026-11-19"
+}
