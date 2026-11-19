@@ -138,6 +138,12 @@ NAME_ALIASES = {
     "Stade Brestois 29": "Brest", "RC Strasbourg": "Strasbourg", "FC Nantes": "Nantes",
     "Montpellier HSC": "Montpellier", "Toulouse FC": "Toulouse", "Angers SCO": "Angers",
     "AJ Auxerre": "Auxerre", "Le Havre AC": "Le Havre", "Saint-Etienne": "St Etienne",
+    # neopromosse: il nome football-data puo' variare, provo le varianti in ordine
+    "Coventry City": ["Coventry"], "Hull City": ["Hull"],
+    "Deportivo": ["La Coruna", "Deportivo", "Dep. La Coruna"],
+    "Racing Santander": ["Santander", "Racing Santander", "Racing"],
+    "FC Cologne": ["FC Koln", "Koln", "Cologne"],
+    "SC Paderborn 07": ["Paderborn", "Paderborn 07"],
     "Bosnia-Herzegovina": "Bosnia and Herzegovina",
     "Bosnia & Herzegovina": "Bosnia and Herzegovina",
     "Man Utd": "Man United",
@@ -262,12 +268,19 @@ def resolve_name(name, known):
     plain = _plain(name)
     for cand in (name, plain):
         alt = NAME_ALIASES.get(cand)
-        if alt and alt in known:
-            return alt
+        for a in ([alt] if isinstance(alt, str) else (alt or [])):
+            if a in known:
+                return a
     if plain in known:
         return plain
     close = difflib.get_close_matches(plain, list(known), n=1, cutoff=0.78)
-    return close[0] if close else None
+    if close:
+        return close[0]
+    # nome piu' corto contenuto in quello piu' lungo (es. "Coventry City" / "Coventry"),
+    # solo se il candidato e' uno solo
+    pl = plain.lower()
+    hits = [k for k in known if len(k) >= 5 and (k.lower() in pl or pl in k.lower())]
+    return hits[0] if len(hits) == 1 else None
 
 
 # ----------------------------- MODELLO ---------------------------------
