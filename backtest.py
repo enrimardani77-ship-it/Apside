@@ -418,6 +418,59 @@ def save_params(params):
         json.dump(params, f, indent=1)
 
 
+# ----------------------------- ANCORAGGIO AL MERCATO --------------------
+ANCHOR_SAMPLE = 700      # partite usate per il confronto (il calcolo e' lento)
+ANCHOR_WS = (0.5, 0.8, 1.0)
+
+
+def anchor_eval(preds, spread):
+    """Confronta modello puro, modello ancorato alle quote (vari pesi) e mercato.
+    Ritorna (righe di testo, miglior peso)."""
+    pm = [p for p in preds if all(k in p["m"].get("avg", {}) for k in ("1", "X", "2", "O2.5", "U2.5"))]
+    if len(pm) < 60:
+        return ["Ancoraggio al mercato: troppe poche partite con quote per misurarlo."], vb.MARKET_W
+    step = max(1, len(pm) // ANCHOR_SAMPLE)
+    pm = pm[::step]
+    rows = {"modello puro": [], "mercato": []}
+    for w in ANCHOR_WS:
+        rows["ancorato %d%%" % round(w * 100)] = []
+    res = {k: [] for k in rows}
+    for p in pm:
+        a = p["m"]["avg"]
+        tgt = {"p": vb.devig([a["1"], a["X"], a["2"]]), "ou": vb.devig([a["O2.5"], a["U2.5"]])[0]}
+        idx, tot = result_idx(p["m"]), total(p)
+        def score(p1x2, pover, pu35):
+            return (brier3(p1x2, idx), (pover - (1.0 if tot >= 3 else 0.0)) ** 2,
+                    (pu35 - (1.0 if tot <= 3 else 0.0)) ** 2)
+        res["modello puro"].append(score(model_1x2(p), p["probs"]["O2.5"], p["probs"]["U3.5"]))
+        res["mercato"].append((brier3(tgt["p"], idx), (tgt["ou"] - (1.0 if tot >= 3 else 0.0)) ** 2,
+                               float("nan")))
+        for w in ANCHOR_WS:
+            xg = vb.anchor_xg(p["xg"], tgt, w, spread)
+            pr = vb.market_probs(*xg, spread=spread)
+            res["ancorato %d%%" % round(w * 100)].append(
+                score([pr["1"], pr["X"], pr["2"]], pr["O2.5"], pr["U3.5"]))
+    L = ["", "Ancoraggio alle quote (su %d partite con quote; Brier, piu' basso = meglio):" % len(pm)]
+    best_w, best_o = 0.0, None
+    for name, lst in res.items():
+        b1 = _mean([x[0] for x in lst])
+        bo = _mean([x[1] for x in lst])
+        bu = _mean([x[2] for x in lst if x[2] == x[2]])
+        L.append("  %-14s 1X2 %.4f | Over 2.5 %.4f%s" % (
+            name, b1, bo, (" | Under 3.5 %.4f" % bu) if bu == bu else ""))
+        if name.startswith("ancorato"):
+            o = b1 + 2 * bo + 2 * bu
+            if best_o is None or o < best_o:
+                best_o, best_w = o, float(name.split()[1].rstrip("%")) / 100
+        if name == "modello puro":
+            pure_o = b1 + 2 * bo + 2 * bu
+    if best_o is not None and pure_o <= best_o:
+        best_w = 0.0
+    L.append("  peso migliore: %d%% %s" % (round(best_w * 100),
+             "(il modello puro non viene migliorato)" if best_w == 0 else "(meglio del modello puro)"))
+    return L, best_w
+
+
 # ----------------------------- MAIN -------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -462,6 +515,11 @@ def main():
             L += ["", "Guardia partite squilibrate (club): " +
                   ("serve dalla soglia %.2f gol attesi" % g if g < 99 else "non serve, tolta")]
         L += summarize(preds, "CLUB (5 campionati)", True, "club")
+        print("Confronto con l'ancoraggio al mercato...")
+        al, bw = anchor_eval(preds, vb.SPREAD_CLUB)
+        L += al
+        if args.tune:
+            params["market_w"] = bw
 
     if intl_ms is not None:
         print("Calcolo il backtest delle nazionali...")
