@@ -37,6 +37,10 @@ h1{font-size:1.45rem;margin:0;letter-spacing:-.01em}
 .sub{color:var(--mut);font-size:.88rem}
 h2{font-size:1.02rem;margin:22px 0 8px}
 .actions{display:flex;gap:10px}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.controls #league{grid-column:1/-1}
+.controls input{margin:0;min-width:0}
+.scope{display:inline-block;font-size:.8rem;font-weight:650;color:var(--acc);background:var(--soft);border-radius:99px;padding:4px 11px;margin-top:12px}
 .btn{flex:1;border:0;border-radius:14px;padding:15px 16px;font-size:1.05rem;font-weight:700;color:#fff;
 background:linear-gradient(135deg,var(--acc2),var(--acc))}
 .btn:disabled{opacity:.6}
@@ -104,13 +108,24 @@ details.box summary{cursor:pointer;font-weight:600}
 .foot{margin-top:22px;font-size:.78rem;color:var(--mut)}
 </style></head><body>
 <header><div class="orb">🔮</div><div><h1>L’Oracolo</h1><div class="sub">Consigli sul calcio, calcolati dai dati</div></div></header>
-<div class="actions">
-  <button id="go" class="btn">▶ Chiedi all’Oracolo</button>
-  <select id="days" aria-label="Giorni"><option value="1">Oggi</option><option value="2">2 giorni</option><option value="3">3 giorni</option></select>
+<div class="actions"><button id="go" class="btn">▶ Chiedi all’Oracolo</button></div>
+<div class="controls">
+  <select id="league" aria-label="Campionato">
+    <option value="tutti">Tutti i campionati</option>
+    <option value="E0">Premier League</option>
+    <option value="SP1">La Liga</option>
+    <option value="D1">Bundesliga</option>
+    <option value="I1">Serie A</option>
+    <option value="F1">Ligue 1</option>
+    <option value="intl">Nazionali</option>
+  </select>
+  <input id="date" type="date" aria-label="Data da analizzare">
+  <select id="days" aria-label="Giorni"><option value="1">1 giorno</option><option value="2">2 giorni</option><option value="3">3 giorni</option><option value="7">1 settimana</option></select>
 </div>
 <div id="progress" class="progress hidden"><div class="pbar"><i id="pfill"></i></div><div id="pstep" class="pstep"></div></div>
 <div id="status" class="upd"></div>
 <div id="app" class="hidden">
+  <div id="scope" class="scope hidden"></div>
   <div id="tiles" class="tiles"></div>
   <section id="top"></section>
   <section id="combos"></section>
@@ -144,6 +159,11 @@ const el = (tag, cls, text) => {
 const pct = (p) => Math.round(p * 100) + "%";
 const conf = (p) => (p >= 0.75 ? "hi" : p >= 0.66 ? "mid" : "lo");
 let activeLeague = "Tutte";
+function todayStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
 
 function getToken() { try { return localStorage.getItem("gh_token") || ""; } catch (e) { return ""; } }
 function setToken(t) { try { if (t) localStorage.setItem("gh_token", t); else localStorage.removeItem("gh_token"); } catch (e) {} }
@@ -272,6 +292,11 @@ function render(d, flash) {
   $("out").classList.toggle("hidden", structured);
   if (structured) {
     if (activeLeague !== "Tutte" && !v.matches.some((m) => m.league === activeLeague)) activeLeague = "Tutte";
+    const sc = $("scope");
+    if (v.scope) {
+      sc.textContent = v.scope.label + " · " + v.scope.date + (v.scope.days > 1 ? " (" + v.scope.days + " giorni)" : "");
+      sc.classList.remove("hidden");
+    } else { sc.classList.add("hidden"); }
     renderTiles(v); renderTop(v); renderCombos(v); renderChips(v); renderMatches(v);
     $("gnotes").textContent = (v.notes || []).join(" ");
   } else {
@@ -299,6 +324,9 @@ function progress(sec) {
 async function run() {
   const tok = getToken();
   if (!tok) { $("settings").open = true; setStatus("Prima salva il token nelle Impostazioni."); return; }
+  const date = $("date").value || todayStr();
+  if (date < todayStr()) { setStatus("Scegli la data di oggi o di un giorno futuro."); return; }
+  try { localStorage.setItem("oracolo_league", $("league").value); } catch (e) {}
   $("go").disabled = true;
   setStatus("Avvio dell’analisi…");
   let before = null;
@@ -308,7 +336,7 @@ async function run() {
       method: "POST",
       headers: { "Accept": "application/vnd.github+json", "Authorization": "Bearer " + tok,
                  "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
-      body: JSON.stringify({ ref: "main", inputs: { days: $("days").value } })
+      body: JSON.stringify({ ref: "main", inputs: { days: $("days").value, league: $("league").value, date: date } })
     });
     if (r.status !== 204) {
       setStatus(r.status === 401 || r.status === 403 || r.status === 404
@@ -347,6 +375,9 @@ $("go").addEventListener("click", run);
 $("save").addEventListener("click", () => { setToken($("tok").value.trim()); $("tok").value = ""; tokState(); });
 $("clear").addEventListener("click", () => { setToken(""); tokState(); });
 tokState();
+$("date").min = todayStr();
+$("date").value = todayStr();
+try { const l = localStorage.getItem("oracolo_league"); if (l) $("league").value = l; } catch (e) {}
 try { render(JSON.parse($("boot").textContent), false); } catch (e) {}
 getLatest().then((d) => render(d, false)).catch(() => {});
 </script>
@@ -389,14 +420,35 @@ def main():
     ap.add_argument("--days", type=int, default=1)
     ap.add_argument("--no-intl", action="store_true")
     ap.add_argument("--no-club", action="store_true")
+    ap.add_argument("--league", default="tutti")    # tutti, E0, SP1, D1, I1, F1, intl
+    ap.add_argument("--date", default="")           # AAAA-MM-GG, vuoto = oggi
     args, _ = ap.parse_known_args()
 
     today = date.today()
-    last = today + timedelta(days=max(args.days, 1) - 1)
+    start, extra_notes = today, []
+    if (args.date or "").strip():
+        try:
+            start = date.fromisoformat(args.date.strip())
+        except ValueError:
+            extra_notes.append("Data non valida: analizzo oggi.")
+        if start < today:
+            start = today
+            extra_notes.append("La data scelta e' passata: analizzo oggi.")
+    last = start + timedelta(days=max(args.days, 1) - 1)
+
+    lg = (args.league or "tutti").strip()
+    with_club, with_intl, divs = not args.no_club, not args.no_intl, None
+    if lg.lower() in ("intl", "nazionali"):
+        with_club = False
+    elif lg.upper() in vb.LEAGUES:
+        divs, with_intl = {lg.upper()}, False
+
     sink, view = [], {}
     try:
-        report = vb.build_report(today, last, not args.no_club, not args.no_intl,
-                                 sink=sink, view=view)
+        report = vb.build_report(start, last, with_club, with_intl,
+                                 sink=sink, view=view, divs=divs)
+        if view is not None and extra_notes:
+            view["notes"] = list(view.get("notes", [])) + extra_notes
     except Exception:
         report = "ERRORE durante l'esecuzione:\n\n" + traceback.format_exc()
         view = {}
