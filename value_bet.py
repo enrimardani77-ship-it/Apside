@@ -256,6 +256,42 @@ def best_odds(row, suffix):
     return best, BOOK_NAMES.get(src, src)
 
 
+def avg_odds(row, suffix):
+    """Quota media dei bookmaker (colonna Avg se c'e', altrimenti media dei singoli)."""
+    try:
+        v = float(row.get("Avg" + suffix))
+        if v > 1.0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    vals = []
+    for p in BOOK_PREFIXES:
+        if p == "Max":
+            continue
+        try:
+            v = float(row.get(p + suffix))
+        except (TypeError, ValueError):
+            continue
+        if v > 1.0:
+            vals.append(v)
+    return sum(vals) / len(vals) if vals else None
+
+
+def odds_sane(row):
+    """False se le quote 1X2 sono rotte: margine fuori norma o una quota Max
+    troppo lontana dalla media (di solito un errore di inserimento)."""
+    inv = 0.0
+    for sfx in ("H", "D", "A"):
+        a = avg_odds(row, sfx)
+        if not a:
+            return False
+        inv += 1.0 / a
+        mx, _ = best_odds(row, sfx)
+        if mx and mx > 1.30 * a:
+            return False
+    return 1.00 <= inv <= 1.15
+
+
 def _plain(name):
     import unicodedata
     return "".join(c for c in unicodedata.normalize("NFKD", name or "")
@@ -868,7 +904,7 @@ def club_matches(today, last, with_props=True, divs=None):
         return [], ["Nessuna partita di %s nel periodo richiesto (il calendario dei club "
                     "copre solo i giorni piu' vicini)." % label]
 
-    models, out, skipped = {}, [], 0
+    models, out, skipped, bad_odds = {}, [], 0, 0
 
     def get_model(div):
         if div not in models:
@@ -909,6 +945,12 @@ def club_matches(today, last, with_props=True, divs=None):
             skipped += 1
             continue
         anchored = False
+        has_odds = bool(avg_odds(r, "H") or best_odds(r, "H")[0])
+        sane = odds_sane(r) if has_odds else True
+        if has_odds and not sane:
+            bad_odds += 1
+            r = {k: v for k, v in r.items()
+                 if not any(k.startswith(p) for p in ["Avg", "Max"] + BOOK_PREFIXES)}
         tgt = market_target(r) if MARKET_W > 0 else None
         if tgt:
             xg = anchor_xg(xg, tgt, MARKET_W, SPREAD_CLUB)
@@ -918,17 +960,20 @@ def club_matches(today, last, with_props=True, divs=None):
             hp, ap = fpl_map.get(r["HomeTeam"]), fpl_map.get(r["AwayTeam"])
             if hp and ap:
                 xg, match_notes = apply_absences(xg, hp, ap)
-        odds = {}
+        odds, avg = {}, {}
         for key, suffix in ODDS_COLUMNS.items():
             o, book = best_odds(r, suffix)
             if o:
                 odds[key] = (o, book)
+                a = avg_odds(r, suffix)
+                if a:
+                    avg[key] = round(a, 2)
         out.append({
             "league": LEAGUES[div], "div": div, "kind": "club",
             "date": parse_date(r.get("Date")).isoformat(),
             "time": (r.get("Time") or "").strip(),
             "home": r["HomeTeam"], "away": r["AwayTeam"],
-            "xg": xg, "probs": market_probs(*xg, spread=SPREAD_CLUB), "odds": odds,
+            "xg": xg, "probs": market_probs(*xg, spread=SPREAD_CLUB), "odds": odds, "avg": avg,
             "notes": match_notes, "anchored": anchored,
             "extra": extra_probs(xg[0], xg[1], SPREAD_CLUB),
             "base": model.get("base", {}) if model else {},
@@ -936,6 +981,8 @@ def club_matches(today, last, with_props=True, divs=None):
         })
     notes = ["%d partite saltate (dati insufficienti o squadre non riconosciute)." % skipped] if skipped else []
     notes += extra_notes
+    if bad_odds:
+        notes.append("%d partite hanno quote anomale (margine o quote fuori norma): le ho ignorate." % bad_odds)
     n_anch = sum(1 for m in out if m.get("anchored"))
     if n_anch:
         notes.append("Per %d partite le probabilita' sono ancorate alle quote di mercato (peso %d%%)." % (
@@ -1051,13 +1098,15 @@ def intl_matches(today, last):
 
 
 # ----------------------------- REPORT -----------------------------------
-def pick_line(prefix, key, p, odds):
+def pick_line(prefix, key, p, odds, avg=None):
     line = "  %s %s - prob %.0f%% - gioca se quota >= %.2f" % (
         prefix, MARKET_LABELS[key], p * 100, MARGIN / p)
     if key in odds:
         o, book = odds[key]
         verdict = "OK" if o >= MARGIN / p else "troppo bassa"
         line += "\n     quota trovata %.2f (%s): %s" % (o, book, verdict)
+        if avg and key in avg and avg[key] < o:
+            line += " [media dei bookmaker %.2f]" % avg[key]
     return line
 
 
@@ -1148,16 +1197,16 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
         if not safe:
             lines.append("  Partita incerta: salta.")
         else:
-            lines.append(pick_line("SICURA:", safe[0], safe[1], m["odds"]))
+            lines.append(pick_line("SICURA:", safe[0], safe[1], m["odds"], m.get("avg")))
             if bold:
-                lines.append(pick_line("PIU' QUOTA (piu' rischio):", bold[0], bold[1], m["odds"]))
+                lines.append(pick_line("PIU' QUOTA (piu' rischio):", bold[0], bold[1], m["odds"], m.get("avg")))
         for pl in m.get("props", []):
             lines.append("  " + pl)
 
     if notes:
         lines += [""] + notes
     if view is not None:
-        def _pick(pk, odds):
+        def _pick(pk, odds, avg=None):
             if not pk:
                 return None
             key, p = pk[0], pk[1]
@@ -1166,6 +1215,8 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
             if key in odds:
                 o, book = odds[key]
                 d["odds"], d["book"], d["ok"] = o, book, bool(o >= MARGIN / p)
+                if avg and key in avg and avg[key] < o:
+                    d["avg"] = avg[key]
             return d
         combos = []
         for n in (2, 3, 5):
@@ -1190,7 +1241,7 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
                          "mismatch": bool(m.get("mismatch")),
                          "anchored": bool(m.get("anchored")),
                          "markets": market_groups(m),
-                         "safe": _pick(s, m["odds"]), "bold": _pick(b, m["odds"]),
+                         "safe": _pick(s, m["odds"], m.get("avg")), "bold": _pick(b, m["odds"], m.get("avg")),
                          "notes": list(m.get("notes", [])), "props": list(m.get("props", []))}
                         for m, s, b in ordered],
             "notes": list(notes),

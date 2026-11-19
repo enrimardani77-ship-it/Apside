@@ -72,7 +72,8 @@ def load_club(today):
                 data[div].append({"d": d, "h": r["HomeTeam"], "a": r["AwayTeam"],
                                   "hg": hg, "ag": ag, "neutral": False,
                                   "avg": odds_of(r, ("Avg", "B365")),
-                                  "max": odds_of(r, ("Max", "B365"))})
+                                  "max": odds_of(r, ("Max", "B365")),
+                                  "close": odds_of(r, ("PSC", "AvgC", "B365C"))})
         data[div].sort(key=lambda m: m["d"])
     return data
 
@@ -239,6 +240,40 @@ def xg_buckets(preds):
     return L if len(L) > 1 else []
 
 
+def clv_lines(preds):
+    """Confronto con le quote di chiusura (le piu' precise del mercato).
+    CLV = rendimento atteso della quota presa se la 'vera' probabilita' fosse quella
+    di chiusura senza margine. Se e' positivo, prendi in media prezzi migliori del mercato."""
+    pc = [p for p in preds if all(k in p["m"].get("close", {}) for k in ("1", "X", "2"))]
+    if len(pc) < 100:
+        return ["Quote di chiusura: troppo poche partite con la colonna compilata (%d) per usarle." % len(pc)]
+    L = ["Quote di chiusura (su %d partite):" % len(pc)]
+    b_mod = _mean([brier3(model_1x2(p), result_idx(p["m"])) for p in pc])
+    fair = []
+    for p in pc:
+        c = p["m"]["close"]
+        fair.append(devig([c["1"], c["X"], c["2"]]))
+    b_cl = _mean([brier3(f, result_idx(p["m"])) for p, f in zip(pc, fair)])
+    L.append("  Brier 1X2: modello %.4f | chiusura %.4f (piu' basso = meglio)" % (b_mod, b_cl))
+    for label, src in (("quota media", "avg"), ("quota massima", "max")):
+        vals_all, vals_vb = [], []
+        for p, f in zip(pc, fair):
+            for i, k in enumerate(("1", "X", "2")):
+                o = p["m"][src].get(k)
+                if not o:
+                    continue
+                clv = o * f[i] - 1
+                vals_all.append(clv)
+                if p["probs"][k] * o - 1 >= 0.05 and p["probs"][k] >= 0.30:
+                    vals_vb.append(clv)
+        if vals_all:
+            L.append("  CLV con %s: tutte le giocate %+.1f%%%s" % (
+                label, 100 * _mean(vals_all),
+                (" | solo i value bet (%d) %+.1f%%" % (len(vals_vb), 100 * _mean(vals_vb))) if len(vals_vb) >= 30 else ""))
+    L.append("  (zero = prezzo giusto; negativo = paghi il margine; la quota massima si avvicina a zero)")
+    return L
+
+
 def summarize(preds, title, market, kind):
     L = ["", "== %s: %d partite ==" % (title, len(preds))]
     if not preds:
@@ -322,6 +357,7 @@ def summarize(preds, title, market, kind):
             hits = sum(1 for _, hit in bets if hit)
             L.append("Value bet (valore >= 5%%, quota massima): %d giocate, %d azzeccate (%.0f%%), resa %+.1f%%" % (
                 len(bets), hits, 100.0 * hits / len(bets), 100.0 * profit / len(bets)))
+        L += clv_lines(preds)
         blind = []
         for p in preds:
             o = p["m"]["avg"]

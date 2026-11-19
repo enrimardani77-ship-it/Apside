@@ -192,7 +192,8 @@ function pickBox(tag, pick) {
   box.append(top, meter, el("div", "pick-sub", "Gioca solo se la quota è almeno " + pick.minodds.toFixed(2)));
   if (pick.odds) {
     box.append(el("div", "badge " + (pick.ok ? "ok" : "bad"),
-      "Quota trovata " + pick.odds.toFixed(2) + " (" + pick.book + "): " + (pick.ok ? "conviene" : "troppo bassa")));
+      "Quota trovata " + pick.odds.toFixed(2) + " (" + pick.book + "): " + (pick.ok ? "conviene" : "troppo bassa") +
+      (pick.avg ? " · media " + pick.avg.toFixed(2) : "")));
   }
   return box;
 }
