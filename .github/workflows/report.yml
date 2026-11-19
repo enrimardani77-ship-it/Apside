@@ -4,8 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       days:
-        description: "Quanti giorni (1 = solo oggi)"
+        description: "Quanti giorni analizzare (1 = solo la data scelta)"
         default: "1"
+      league:
+        description: "tutti, E0 (Premier), SP1 (Liga), D1 (Bundesliga), I1 (Serie A), F1 (Ligue 1), intl (Nazionali)"
+        default: "tutti"
+      date:
+        description: "Data da analizzare AAAA-MM-GG (vuoto = oggi)"
+        default: ""
   schedule:
     - cron: "30 6 * * *"   # mattina: 06:30 UTC (7:30 o 8:30 in Italia)
     - cron: "30 14 * * *"  # pomeriggio: 14:30 UTC (15:30 o 16:30 in Italia)
@@ -36,7 +42,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           DAYS: ${{ github.event.inputs.days || '1' }}
-        run: python build_site.py --days "$DAYS"
+          LEAGUE: ${{ github.event.inputs.league || 'tutti' }}
+          RUN_DATE: ${{ github.event.inputs.date || '' }}
+        run: python build_site.py --days "$DAYS" --league "$LEAGUE" --date "$RUN_DATE"
       - name: Salva ultimo risultato
         run: |
           git config user.name "github-actions[bot]"
