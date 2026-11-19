@@ -101,6 +101,12 @@ border-left:5px solid var(--lo);border-radius:14px;padding:11px 12px;margin-bott
 .badge.ok{background:rgba(22,163,74,.15);color:var(--hi)}.badge.bad{background:rgba(220,38,38,.14);color:var(--bad)}
 .props{margin-top:10px;font-size:.86rem}.ptitle{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:700}
 .pline{margin:3px 0}
+.mk{margin-top:12px}.mkg{margin-top:8px}
+.mkrow{display:flex;align-items:baseline;gap:8px;padding:5px 0;border-top:1px solid var(--line);font-size:.88rem}
+.mkrow .l{flex:1}.mkrow .p{font-weight:700;min-width:2.8em;text-align:right}.mkrow .q{color:var(--mut);min-width:5.5em;text-align:right}
+.mkrow .d{min-width:3.2em;text-align:right;font-size:.8rem}.d.up{color:var(--hi)}.d.dn{color:var(--bad)}
+.tagm{display:inline-block;margin-top:6px;font-size:.75rem;color:var(--mut);border:1px solid var(--line);border-radius:8px;padding:2px 8px}
+.mkh{font-size:.72rem;color:var(--mut);margin:4px 0}
 .empty{color:var(--mut);font-size:.92rem;padding:8px 2px}
 pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px solid var(--line);padding:14px;border-radius:12px;font:13px/1.5 ui-monospace,Menlo,monospace}
 details.box{margin-top:16px;color:var(--mut);font-size:.92rem}
@@ -207,6 +213,29 @@ function matchCard(m, open) {
   (m.notes || []).forEach((n) => body.append(el("div", "note", n)));
   body.append(m.safe ? pickBox("Sicura", m.safe) : el("div", "empty", "Partita incerta: nessuna giocata abbastanza solida."));
   if (m.bold) body.append(pickBox("Più quota", m.bold));
+  if (m.anchored) body.append(el("div", "tagm", "Ancorata alle quote di mercato"));
+  if (m.markets && m.markets.length) {
+    const mk = el("div", "mk");
+    mk.append(el("div", "ptitle", "Altre proposte"));
+    mk.append(el("div", "mkh", "probabilità · quota minima · scarto dalla media del campionato (punti)"));
+    m.markets.forEach((g) => {
+      const gd = el("div", "mkg");
+      gd.append(el("div", "ptitle", g.name));
+      g.items.forEach((it) => {
+        const row = el("div", "mkrow");
+        row.append(el("span", "l", it.label));
+        row.append(el("span", "p", pct(it.prob)));
+        row.append(el("span", "q", "min " + it.minodds.toFixed(2)));
+        if (typeof it.delta === "number") {
+          row.append(el("span", "d " + (it.delta > 0 ? "up" : it.delta < 0 ? "dn" : ""),
+            (it.delta > 0 ? "+" : "") + it.delta));
+        }
+        gd.append(row);
+      });
+      mk.append(gd);
+    });
+    body.append(mk);
+  }
   if (m.props && m.props.length) {
     const p = el("div", "props");
     p.append(el("div", "ptitle", "Cartellini e tiri in porta"));
