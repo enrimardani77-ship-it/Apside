@@ -72,6 +72,10 @@ PROPS_MARGIN = 1.10
 YELLOW_PRIOR_RATE = 0.12   # ammonizioni ogni 90' di un giocatore "medio"
 YELLOW_PRIOR_W = 5.0       # peso di questo valore iniziale (in partite da 90')
 
+# Calendario di riserva per i club (ESPN, non ufficiale): serve quando fixtures.csv
+# di football-data.co.uk non contiene ancora la giornata richiesta.
+ESPN_CLUB = {"E0": "eng.1", "SP1": "esp.1", "D1": "ger.1", "I1": "ita.1", "F1": "fra.1"}
+
 HALF_LIFE_CLUB = 240     # giorni: il peso di una partita si dimezza ogni 240 gg
 HALF_LIFE_INTL = 365
 INTL_YEARS = 4
@@ -110,6 +114,30 @@ MANUAL_FIXTURES = [
 ]
 
 NAME_ALIASES = {
+    # club: nomi ESPN -> nomi football-data
+    "Inter Milan": "Inter", "Internazionale": "Inter", "AC Milan": "Milan",
+    "AS Roma": "Roma", "Atalanta BC": "Atalanta", "Bologna FC": "Bologna",
+    "Hellas Verona": "Verona", "Manchester United": "Man United",
+    "Manchester City": "Man City", "Tottenham Hotspur": "Tottenham",
+    "Newcastle United": "Newcastle", "Wolverhampton Wanderers": "Wolves",
+    "Nottingham Forest": "Nott'm Forest", "Brighton & Hove Albion": "Brighton",
+    "West Ham United": "West Ham", "Leeds United": "Leeds", "AFC Bournemouth": "Bournemouth",
+    "Leicester City": "Leicester", "Ipswich Town": "Ipswich",
+    "Atletico Madrid": "Ath Madrid", "Athletic Club": "Ath Bilbao", "Real Betis": "Betis",
+    "Real Sociedad": "Sociedad", "Celta Vigo": "Celta", "Rayo Vallecano": "Vallecano",
+    "Espanyol": "Espanol", "Deportivo Alaves": "Alaves", "Real Valladolid": "Valladolid",
+    "Borussia Dortmund": "Dortmund", "Bayer Leverkusen": "Leverkusen",
+    "Borussia Monchengladbach": "M'gladbach", "Eintracht Frankfurt": "Ein Frankfurt",
+    "VfB Stuttgart": "Stuttgart", "VfL Wolfsburg": "Wolfsburg", "SC Freiburg": "Freiburg",
+    "FSV Mainz 05": "Mainz", "1. FC Union Berlin": "Union Berlin", "FC Augsburg": "Augsburg",
+    "TSG Hoffenheim": "Hoffenheim", "1. FC Heidenheim 1846": "Heidenheim",
+    "FC St. Pauli": "St Pauli", "VfL Bochum": "Bochum", "Bayern Munich": "Bayern Munich",
+    "Paris Saint-Germain": "Paris SG", "Olympique de Marseille": "Marseille",
+    "Olympique Lyonnais": "Lyon", "AS Monaco": "Monaco", "Stade Rennais": "Rennes",
+    "OGC Nice": "Nice", "LOSC Lille": "Lille", "RC Lens": "Lens", "Stade de Reims": "Reims",
+    "Stade Brestois 29": "Brest", "RC Strasbourg": "Strasbourg", "FC Nantes": "Nantes",
+    "Montpellier HSC": "Montpellier", "Toulouse FC": "Toulouse", "Angers SCO": "Angers",
+    "AJ Auxerre": "Auxerre", "Le Havre AC": "Le Havre", "Saint-Etienne": "St Etienne",
     "Bosnia-Herzegovina": "Bosnia and Herzegovina",
     "Bosnia & Herzegovina": "Bosnia and Herzegovina",
     "Man Utd": "Man United",
@@ -203,13 +231,23 @@ def best_odds(row, suffix):
     return best, BOOK_NAMES.get(src, src)
 
 
+def _plain(name):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", name or "")
+                   if not unicodedata.combining(c))
+
+
 def resolve_name(name, known):
     if name in known:
         return name
-    alt = NAME_ALIASES.get(name)
-    if alt and alt in known:
-        return alt
-    close = difflib.get_close_matches(name, list(known), n=1, cutoff=0.78)
+    plain = _plain(name)
+    for cand in (name, plain):
+        alt = NAME_ALIASES.get(cand)
+        if alt and alt in known:
+            return alt
+    if plain in known:
+        return plain
+    close = difflib.get_close_matches(plain, list(known), n=1, cutoff=0.78)
     return close[0] if close else None
 
 
@@ -551,6 +589,36 @@ def build_props(model, r, div, fpl_map):
     return lines
 
 
+def espn_club_rows(div, day):
+    """Partite non ancora giocate di un campionato in un giorno (calendario ESPN),
+    nel formato delle righe di fixtures.csv. I nomi vanno poi mappati sul modello."""
+    url = ESPN_URL.format(slug=ESPN_CLUB[div], d=day.strftime("%Y%m%d"))
+    try:
+        data = json.loads(download(url))
+    except Exception:
+        return []
+    out = []
+    for ev in data.get("events", []) or []:
+        state = (((ev.get("status") or {}).get("type") or {}).get("state"))
+        if state and state != "pre":
+            continue
+        comp = (ev.get("competitions") or [{}])[0]
+        home = away = None
+        for c in comp.get("competitors", []) or []:
+            nm = (c.get("team") or {}).get("displayName")
+            if c.get("homeAway") == "home":
+                home = nm
+            elif c.get("homeAway") == "away":
+                away = nm
+        dt = parse_iso_local(ev.get("date"))
+        if not home or not away or not dt:
+            continue
+        out.append({"Div": div, "Date": dt.date().strftime("%d/%m/%Y"),
+                    "Time": dt.strftime("%H:%M"), "HomeTeam": home, "AwayTeam": away,
+                    "_espn": True})
+    return out
+
+
 def club_matches(today, last, with_props=True, divs=None):
     """Ritorna (lista_partite, note). Ogni partita e' un dict."""
     try:
@@ -559,15 +627,61 @@ def club_matches(today, last, with_props=True, divs=None):
         return [], ["Calendario club non scaricabile: %s" % e]
 
     todays = []
+    have = set()
     for r in fixtures:
         d = parse_date(r.get("Date"))
         if r.get("Div") in LEAGUES and (divs is None or r.get("Div") in divs) \
                 and d and today <= d <= last:
             todays.append(r)
+            have.add((r["Div"], d))
+
+    # giorni senza partite in fixtures.csv: provo il calendario ESPN
+    wanted = [x for x in LEAGUES if divs is None or x in divs]
+    espn_seen, extra_notes = set(), []
+    day = today
+    while day <= last:
+        for div in wanted:
+            if (div, day) in have:
+                continue
+            for r in espn_club_rows(div, day):
+                d = parse_date(r["Date"])
+                key = (div, r["HomeTeam"], r["AwayTeam"])
+                if d and today <= d <= last and key not in espn_seen \
+                        and (div, d) not in have:
+                    espn_seen.add(key)
+                    todays.append(r)
+        day += timedelta(days=1)
+    if espn_seen:
+        extra_notes.append("Calendario di %d partite preso da ESPN: per queste non ho le quote "
+                           "dei bookmaker, solo la quota minima." % len(espn_seen))
     if not todays:
         label = ", ".join(LEAGUES[x] for x in sorted(divs) if x in LEAGUES) if divs else "i 5 campionati"
         return [], ["Nessuna partita di %s nel periodo richiesto (il calendario dei club "
                     "copre solo i giorni piu' vicini)." % label]
+
+    models, out, skipped = {}, [], 0
+
+    def get_model(div):
+        if div not in models:
+            print("Calcolo modello %s..." % LEAGUES[div])
+            rows_h = load_club_rows(div, today)
+            models[div] = build_models(rows_h) if rows_h else None
+        return models[div]
+
+    # nomi ESPN -> nomi usati dal modello (football-data)
+    mapped = []
+    for r in todays:
+        if r.get("_espn"):
+            m0 = get_model(r["Div"])
+            known = set(m0["goals"]["team_w"]) if m0 and m0.get("goals") else set()
+            h2 = resolve_name(r["HomeTeam"], known) if known else None
+            a2 = resolve_name(r["AwayTeam"], known) if known else None
+            if not h2 or not a2:
+                skipped += 1
+                continue
+            r["HomeTeam"], r["AwayTeam"] = h2, a2
+        mapped.append(r)
+    todays = mapped
 
     fpl_map, fpl_failed = None, False
     e0 = [r for r in todays if r["Div"] == "E0"]
@@ -576,14 +690,9 @@ def club_matches(today, last, with_props=True, divs=None):
         fpl_map = load_fpl_map(known)
         fpl_failed = fpl_map is None
 
-    models, out, skipped = {}, [], 0
     for r in todays:
         div = r["Div"]
-        if div not in models:
-            print("Calcolo modello %s..." % LEAGUES[div])
-            rows_h = load_club_rows(div, today)
-            models[div] = build_models(rows_h) if rows_h else None
-        model = models[div]
+        model = get_model(div)
         gm = model["goals"] if model else None
         xg = (expected_goals(gm, r["HomeTeam"], r["AwayTeam"], False, MIN_W_CLUB)
               if gm else None)
@@ -609,7 +718,8 @@ def club_matches(today, last, with_props=True, divs=None):
             "notes": match_notes,
             "props": build_props(model, r, div, fpl_map) if (with_props and model) else [],
         })
-    notes = ["%d partite saltate (dati insufficienti)." % skipped] if skipped else []
+    notes = ["%d partite saltate (dati insufficienti o squadre non riconosciute)." % skipped] if skipped else []
+    notes += extra_notes
     if fpl_failed:
         notes.append("Infortuni Premier non disponibili (fonte FPL non raggiunta).")
     return out, notes
