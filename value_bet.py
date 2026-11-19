@@ -168,9 +168,27 @@ MARKET_LABELS = {
     "U3.5": "Under 3.5 gol", "O3.5": "Over 3.5 gol",
     "GG": "Gol (segnano entrambe)", "NG": "No Gol (almeno una a secco)",
 }
+MARKET_LABELS.update({
+    "MG13": "Multigol 1-3", "MG14": "Multigol 1-4", "MG24": "Multigol 2-4", "MG25": "Multigol 2-5",
+    "1X&U3.5": "1X + Under 3.5", "X2&U3.5": "X2 + Under 3.5",
+    "1X&O1.5": "1X + Over 1.5", "X2&O1.5": "X2 + Over 1.5", "GG&O2.5": "Gol + Over 2.5",
+})
+# gruppi di proposte mostrati nella pagina: (titolo, mercati, margine del bookmaker)
+EXTRA_MARGIN = 1.10      # multigol, combo e risultati esatti: commissioni piu' alte
+MARKET_GROUPS = [
+    ("Esito e doppie chance", ["1", "X", "2", "1X", "X2", "12"], None),
+    ("Gol totali", ["U1.5", "O1.5", "U2.5", "O2.5", "U3.5", "O3.5"], None),
+    ("Gol / No Gol", ["GG", "NG"], None),
+    ("Multigol", ["MG13", "MG14", "MG24", "MG25"], EXTRA_MARGIN),
+    ("Combo", ["1X&U3.5", "X2&U3.5", "1X&O1.5", "X2&O1.5", "GG&O2.5"], EXTRA_MARGIN),
+]
 # colonne quote football-data per i mercati che ci sono nel CSV
 ODDS_COLUMNS = {"1": "H", "X": "D", "2": "A", "O2.5": ">2.5", "U2.5": "<2.5"}
 
+
+# Ancoraggio alle quote di mercato (solo club con quote nel calendario): 0 = solo modello,
+# 1 = le quote 1X2 e Over/Under 2.5 decidono tutto. Il backtest dice se conviene.
+MARKET_W = 0.8
 
 # Parametri ottimizzati dal backtest: se esiste data/params.json sostituiscono
 # i valori di default qui sopra (per tornare indietro basta cancellare il file).
@@ -190,6 +208,7 @@ DC_RHO = _P.get("dc_rho", DC_RHO)
 MISMATCH_XG_CLUB = _P.get("mismatch_xg_club", MISMATCH_XG_CLUB)
 MISMATCH_XG_INTL = _P.get("mismatch_xg_intl", MISMATCH_XG_INTL)
 MISMATCH_RATIO = _P.get("mismatch_ratio", MISMATCH_RATIO)
+MARKET_W = _P.get("market_w", MARKET_W)
 
 
 # ----------------------------- UTILITA' --------------------------------
@@ -389,6 +408,182 @@ def choose_picks(probs):
 
 
 # ----------------------------- CALENDARI -------------------------------
+# ----------------------------- ANCORAGGIO AL MERCATO --------------------
+def devig(odds):
+    """Da quote a probabilita' senza la commissione del bookmaker."""
+    inv = [1.0 / o for o in odds]
+    t = sum(inv)
+    return [i / t for i in inv]
+
+
+def market_target(r):
+    """Probabilita' di mercato dalla riga di fixtures.csv: {"p": [1, X, 2], "ou": Over2.5}
+    oppure None se mancano le quote."""
+    def read(prefixes, suffixes):
+        vals = []
+        for p in prefixes:
+            try:
+                v = [float(r.get(p + sfx)) for sfx in suffixes]
+            except (TypeError, ValueError):
+                continue
+            if all(x > 1.0 for x in v):
+                vals.append(devig(v))
+        return [sum(c) / len(vals) for c in zip(*vals)] if vals else None
+    others = [p for p in BOOK_PREFIXES if p != "Max"]
+    p3 = read(["Avg"], ("H", "D", "A")) or read(others, ("H", "D", "A"))
+    if not p3:
+        return None
+    ou = read(["Avg"], (">2.5", "<2.5")) or read(others, (">2.5", "<2.5"))
+    return {"p": p3, "ou": ou[0] if ou else None}
+
+
+def _quad(lh, la, spread=0.0, maxg=8):
+    """(P(1), P(X), P(2), P(Over 2.5)) con lo stesso modello di market_probs."""
+    scen = [(1.0, 1.0)] if spread <= 0 else [(0.3, 1 - spread), (0.4, 1.0), (0.3, 1 + spread)]
+    r1 = rx = r2 = ro = 0.0
+    for w, f in scen:
+        a, b = lh * f, la * f
+        pa = [poisson_pmf(i, a) for i in range(maxg + 1)]
+        pb = [poisson_pmf(i, b) for i in range(maxg + 1)]
+        t = s1 = sx = s2 = so = 0.0
+        for i in range(maxg + 1):
+            for j in range(maxg + 1):
+                p = pa[i] * pb[j] * tau(i, j, a, b, DC_RHO)
+                t += p
+                if i > j:
+                    s1 += p
+                elif i == j:
+                    sx += p
+                else:
+                    s2 += p
+                if i + j >= 3:
+                    so += p
+        r1 += w * s1 / t
+        rx += w * sx / t
+        r2 += w * s2 / t
+        ro += w * so / t
+    return r1, rx, r2, ro
+
+
+def anchor_xg(xg, target, w, spread=0.0):
+    """Sposta i gol attesi verso le probabilita' di mercato (peso w).
+    Con w=0 non cambia nulla; con w=1 il modello riproduce 1X2 e Over 2.5 del mercato."""
+    if w <= 0 or not target:
+        return xg
+    lh, la = xg
+    cur = _quad(lh, la, spread)
+    t3 = [(1 - w) * cur[i] + w * target["p"][i] for i in range(3)]
+    tou = None if target.get("ou") is None else (1 - w) * cur[3] + w * target["ou"]
+
+    def loss(a, b):
+        q = _quad(a, b, spread)
+        e = sum((q[i] - t3[i]) ** 2 for i in range(3))
+        if tou is not None:
+            e += (q[3] - tou) ** 2
+        return e
+
+    best = loss(lh, la)
+    for step in (0.2, 0.08, 0.03, 0.01):
+        for _ in range(8):
+            moved = False
+            for dh, da in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                nh, na = lh + dh * step, la + da * step
+                if not (0.1 <= nh <= 6.0 and 0.1 <= na <= 6.0):
+                    continue
+                e = loss(nh, na)
+                if e < best - 1e-12:
+                    best, lh, la, moved = e, nh, na, True
+            if not moved:
+                break
+    return lh, la
+
+
+# ----------------------------- ALTRE PROPOSTE PER PARTITA ---------------
+def score_markets(hg, ag):
+    """Quali mercati sono 'passati' con questo punteggio (anche quelli extra)."""
+    t = hg + ag
+    d = {"1": hg > ag, "X": hg == ag, "2": hg < ag, "1X": hg >= ag, "X2": hg <= ag,
+         "12": hg != ag, "U1.5": t <= 1, "O1.5": t >= 2, "U2.5": t <= 2, "O2.5": t >= 3,
+         "U3.5": t <= 3, "O3.5": t >= 4, "GG": hg > 0 and ag > 0, "NG": hg == 0 or ag == 0,
+         "MG13": 1 <= t <= 3, "MG14": 1 <= t <= 4, "MG24": 2 <= t <= 4, "MG25": 2 <= t <= 5,
+         "1X&U3.5": hg >= ag and t <= 3, "X2&U3.5": hg <= ag and t <= 3,
+         "1X&O1.5": hg >= ag and t >= 2, "X2&O1.5": hg <= ag and t >= 2,
+         "GG&O2.5": hg > 0 and ag > 0 and t >= 3}
+    d["ES%d-%d" % (hg, ag)] = True
+    return d
+
+
+def base_rates(results):
+    """results: lista di (gol casa, gol ospite, peso). Frequenza media di ogni mercato."""
+    sums, tw = defaultdict(float), 0.0
+    for hg, ag, w in results:
+        tw += w
+        for k, v in score_markets(hg, ag).items():
+            if v:
+                sums[k] += w
+    return {k: v / tw for k, v in sums.items()} if tw > 0 else {}
+
+
+def extra_probs(lh, la, spread=0.0, maxg=8):
+    """Probabilita' di multigol, combo e dei 3 risultati esatti piu' probabili."""
+    scen = [(1.0, 1.0)] if spread <= 0 else [(0.3, 1 - spread), (0.4, 1.0), (0.3, 1 + spread)]
+    acc, score = defaultdict(float), defaultdict(float)
+    for w, f in scen:
+        a, b = lh * f, la * f
+        pa = [poisson_pmf(i, a) for i in range(maxg + 1)]
+        pb = [poisson_pmf(i, b) for i in range(maxg + 1)]
+        grid, t = {}, 0.0
+        for i in range(maxg + 1):
+            for j in range(maxg + 1):
+                p = pa[i] * pb[j] * tau(i, j, a, b, DC_RHO)
+                grid[(i, j)] = p
+                t += p
+        for (i, j), p in grid.items():
+            pn = w * p / t
+            score[(i, j)] += pn
+            for k, v in score_markets(i, j).items():
+                if v and k[:2] in ("MG", "1X", "X2", "GG") and k in MARKET_LABELS \
+                        and k not in ("1X", "X2", "GG"):
+                    acc[k] += pn
+    out = dict(acc)
+    for (i, j), p in sorted(score.items(), key=lambda kv: -kv[1])[:3]:
+        out["ES%d-%d" % (i, j)] = p
+    return out
+
+
+def market_groups(m):
+    """Elenco delle proposte per la pagina: per gruppo, con probabilita',
+    quota minima e scarto (in punti) dalla media storica del campionato."""
+    probs = dict(m["probs"])
+    probs.update(m.get("extra", {}))
+    base = m.get("base") or {}
+
+    def item(k, label, p, marg):
+        d = {"label": label, "prob": round(p, 4), "minodds": round(marg / p, 2)}
+        if base:
+            d["delta"] = int(round((p - base.get(k, 0.0)) * 100))
+        return d
+
+    groups = []
+    for name, keys, marg in MARKET_GROUPS:
+        items = []
+        for k in keys:
+            p = probs.get(k)
+            if p is None or p < 0.10 or p > 0.92:
+                continue
+            if m.get("mismatch") and k in UNDER_KEYS:
+                continue
+            items.append(item(k, MARKET_LABELS[k], p, marg or MARGIN))
+        items.sort(key=lambda x: -x["prob"])
+        if items:
+            groups.append({"name": name, "items": items})
+    ex = sorted(((k, p) for k, p in probs.items() if k.startswith("ES")), key=lambda kv: -kv[1])[:3]
+    if ex:
+        groups.append({"name": "Risultati esatti piu' probabili",
+                       "items": [item(k, "Risultato " + k[2:], p, EXTRA_MARGIN) for k, p in ex]})
+    return groups
+
+
 def load_club_rows(div, today):
     """Storico partite con gol, gialli e tiri in porta (se presenti nel CSV)."""
     out = []
@@ -424,7 +619,8 @@ def build_models(rows):
         ms = [(h, a, s[kh], s[ka], w, False) for h, a, w, s in rows
               if s[kh] is not None and s[ka] is not None]
         return fit_poisson(ms, SHRINK_CLUB) if ms else None
-    return {"goals": mk("hg", "ag"), "cards": mk("hy", "ay"), "sot": mk("hst", "ast")}
+    return {"goals": mk("hg", "ag"), "cards": mk("hy", "ay"), "sot": mk("hst", "ast"),
+            "base": base_rates([(s["hg"], s["ag"], 1.0) for h, a, w, s in rows])}
 
 
 # ----------------------------- INFORTUNI (FPL) ---------------------------
@@ -699,6 +895,11 @@ def club_matches(today, last, with_props=True, divs=None):
         if not xg:
             skipped += 1
             continue
+        anchored = False
+        tgt = market_target(r) if MARKET_W > 0 else None
+        if tgt:
+            xg = anchor_xg(xg, tgt, MARKET_W, SPREAD_CLUB)
+            anchored = True
         match_notes = []
         if div == "E0" and fpl_map:
             hp, ap = fpl_map.get(r["HomeTeam"]), fpl_map.get(r["AwayTeam"])
@@ -715,11 +916,17 @@ def club_matches(today, last, with_props=True, divs=None):
             "time": (r.get("Time") or "").strip(),
             "home": r["HomeTeam"], "away": r["AwayTeam"],
             "xg": xg, "probs": market_probs(*xg, spread=SPREAD_CLUB), "odds": odds,
-            "notes": match_notes,
+            "notes": match_notes, "anchored": anchored,
+            "extra": extra_probs(xg[0], xg[1], SPREAD_CLUB),
+            "base": model.get("base", {}) if model else {},
             "props": build_props(model, r, div, fpl_map) if (with_props and model) else [],
         })
     notes = ["%d partite saltate (dati insufficienti o squadre non riconosciute)." % skipped] if skipped else []
     notes += extra_notes
+    n_anch = sum(1 for m in out if m.get("anchored"))
+    if n_anch:
+        notes.append("Per %d partite le probabilita' sono ancorate alle quote di mercato (peso %d%%)." % (
+            n_anch, round(MARKET_W * 100)))
     if fpl_failed:
         notes.append("Infortuni Premier non disponibili (fonte FPL non raggiunta).")
     return out, notes
@@ -814,6 +1021,7 @@ def intl_matches(today, last):
     if not model:
         return [], ["Storico nazionali vuoto."]
     known = set(model["team_w"].keys())
+    base_i = base_rates([(x[2], x[3], x[4]) for x in hist])
     out, notes = [], []
     for h, a, neu, tour, time_s, fdate in fixtures:
         h2, a2 = resolve_name(h, known), resolve_name(a, known)
@@ -824,7 +1032,8 @@ def intl_matches(today, last):
         out.append({"league": tour, "time": time_s, "home": h, "away": a,
                     "xg": xg, "probs": market_probs(*xg, spread=SPREAD_INTL), "odds": {},
                     "kind": "intl", "date": fdate.isoformat(),
-                    "key_home": h2, "key_away": a2})
+                    "key_home": h2, "key_away": a2,
+                    "extra": extra_probs(xg[0], xg[1], SPREAD_INTL), "base": base_i})
     return out, notes
 
 
@@ -966,6 +1175,8 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
                          "away": m["away"],
                          "xg": [round(m["xg"][0], 1), round(m["xg"][1], 1)],
                          "mismatch": bool(m.get("mismatch")),
+                         "anchored": bool(m.get("anchored")),
+                         "markets": market_groups(m),
                          "safe": _pick(s, m["odds"]), "bold": _pick(b, m["odds"]),
                          "notes": list(m.get("notes", [])), "props": list(m.get("props", []))}
                         for m, s, b in ordered],
