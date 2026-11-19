@@ -551,7 +551,7 @@ def build_props(model, r, div, fpl_map):
     return lines
 
 
-def club_matches(today, last, with_props=True):
+def club_matches(today, last, with_props=True, divs=None):
     """Ritorna (lista_partite, note). Ogni partita e' un dict."""
     try:
         fixtures = read_csv(download(FIXTURES_URL))
@@ -561,10 +561,13 @@ def club_matches(today, last, with_props=True):
     todays = []
     for r in fixtures:
         d = parse_date(r.get("Date"))
-        if r.get("Div") in LEAGUES and d and today <= d <= last:
+        if r.get("Div") in LEAGUES and (divs is None or r.get("Div") in divs) \
+                and d and today <= d <= last:
             todays.append(r)
     if not todays:
-        return [], ["Nessuna partita dei 5 campionati nel periodo richiesto."]
+        label = ", ".join(LEAGUES[x] for x in sorted(divs) if x in LEAGUES) if divs else "i 5 campionati"
+        return [], ["Nessuna partita di %s nel periodo richiesto (il calendario dei club "
+                    "copre solo i giorni piu' vicini)." % label]
 
     fpl_map, fpl_failed = None, False
     e0 = [r for r in todays if r["Div"] == "E0"]
@@ -726,8 +729,17 @@ def pick_line(prefix, key, p, odds):
     return line
 
 
-def build_report(today, last, with_club, with_intl, with_props=True, sink=None, view=None):
+def build_report(today, last, with_club, with_intl, with_props=True, sink=None, view=None,
+                 divs=None):
+    if with_intl and not with_club:
+        scope_label = "Nazionali"
+    elif with_club and not with_intl and divs and len(divs) == 1:
+        scope_label = LEAGUES.get(next(iter(divs)), "Club")
+    else:
+        scope_label = "Tutti i campionati"
     lines = ["L'ORACOLO - consigli del %s" % today.strftime("%d/%m/%Y")]
+    if scope_label != "Tutti i campionati":
+        lines[0] += " (%s)" % scope_label
     if last > today:
         lines[0] += " -> %s" % last.strftime("%d/%m")
     lines.append("Probabilita' stimate dal modello. Gioca solo se la quota "
@@ -735,7 +747,7 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
 
     matches, notes = [], []
     if with_club:
-        m, n = club_matches(today, last, with_props)
+        m, n = club_matches(today, last, with_props, divs)
         matches += m
         notes += n
     if with_intl:
@@ -833,6 +845,8 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
         ordered = sorted(rows, key=lambda r: (r[0]["time"] or "99:99", r[0]["league"]))
         view.update({
             "date": today.strftime("%d/%m/%Y"),
+            "scope": {"label": scope_label, "date": today.strftime("%d/%m/%Y"),
+                      "days": (last - today).days + 1},
             "top": [{"home": m["home"], "away": m["away"], "league": m["league"],
                      "time": m["time"], "label": MARKET_LABELS[s[0]],
                      "prob": round(s[1], 4), "minodds": round(MARGIN / s[1], 2)}
