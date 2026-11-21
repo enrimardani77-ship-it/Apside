@@ -176,6 +176,8 @@ MARKET_LABELS = {
 }
 MARKET_LABELS.update({
     "MG13": "Multigol 1-3", "MG14": "Multigol 1-4", "MG24": "Multigol 2-4", "MG25": "Multigol 2-5",
+    "EP1": "Casa vince o va avanti di 2 (pagamento anticipato)",
+    "EP2": "Ospite vince o va avanti di 2 (pagamento anticipato)",
     "1X&U3.5": "1X + Under 3.5", "X2&U3.5": "X2 + Under 3.5",
     "1X&O1.5": "1X + Over 1.5", "X2&O1.5": "X2 + Over 1.5", "GG&O2.5": "Gol + Over 2.5",
 })
@@ -186,6 +188,7 @@ MARKET_GROUPS = [
     ("Gol totali", ["U1.5", "O1.5", "U2.5", "O2.5", "U3.5", "O3.5"], None),
     ("Gol / No Gol", ["GG", "NG"], None),
     ("Multigol", ["MG13", "MG14", "MG24", "MG25"], EXTRA_MARGIN),
+    ("Pagamento anticipato", ["EP1", "EP2"], EXTRA_MARGIN),
     ("Combo", ["1X&U3.5", "X2&U3.5", "1X&O1.5", "X2&O1.5", "GG&O2.5"], EXTRA_MARGIN),
 ]
 # colonne quote football-data per i mercati che ci sono nel CSV
@@ -573,6 +576,39 @@ def base_rates(results):
     return {k: v / tw for k, v in sums.items()} if tw > 0 else {}
 
 
+def early_payout(lh, la, spread=0.0, steps=90):
+    """(P casa, P ospite) di 'vince o va avanti di 2 gol in qualunque momento'.
+    I gol arrivano a caso nei 90 minuti; calcolo passo per passo la differenza reti."""
+    scen = [(1.0, 1.0)] if spread <= 0 else [(0.3, 1 - spread), (0.4, 1.0), (0.3, 1 + spread)]
+    res = []
+    for sign in (1, -1):
+        tot = 0.0
+        for w, f in scen:
+            a, b = lh * f / steps, la * f / steps
+            ph, pa = 1 - math.exp(-a), 1 - math.exp(-b)
+            if sign < 0:
+                ph, pa = pa, ph
+            lo = -8
+            st = {0: 1.0}          # differenza (nostra squadra - avversaria), non ancora a +2
+            hit = 0.0
+            for _ in range(steps):
+                new = defaultdict(float)
+                for d, p in st.items():
+                    for dh, qh in ((1, ph), (0, 1 - ph)):
+                        for da, qa in ((1, pa), (0, 1 - pa)):
+                            q = p * qh * qa
+                            nd = d + dh - da
+                            if nd >= 2:
+                                hit += q
+                            else:
+                                new[max(nd, lo)] += q
+                st = new
+            win = sum(p for d, p in st.items() if d >= 1)
+            tot += w * (hit + win)
+        res.append(min(tot, 1.0))
+    return res[0], res[1]
+
+
 def extra_probs(lh, la, spread=0.0, maxg=8):
     """Probabilita' di multigol, combo e dei 3 risultati esatti piu' probabili."""
     scen = [(1.0, 1.0)] if spread <= 0 else [(0.3, 1 - spread), (0.4, 1.0), (0.3, 1 + spread)]
@@ -595,6 +631,7 @@ def extra_probs(lh, la, spread=0.0, maxg=8):
                         and k not in ("1X", "X2", "GG"):
                     acc[k] += pn
     out = dict(acc)
+    out["EP1"], out["EP2"] = early_payout(lh, la, spread)
     for (i, j), p in sorted(score.items(), key=lambda kv: -kv[1])[:3]:
         out["ES%d-%d" % (i, j)] = p
     return out
@@ -1226,6 +1263,7 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
                     pp *= r[1][1]
                 combos.append({"n": n, "prob": round(pp, 4), "minodds": round(MARGIN / pp, 2)})
         ordered = sorted(rows, key=lambda r: (r[0]["time"] or "99:99", r[0]["league"]))
+        view["multipla"] = build_multipla(rows)
         view.update({
             "date": today.strftime("%d/%m/%Y"),
             "scope": {"label": scope_label, "date": today.strftime("%d/%m/%Y"),
@@ -1255,6 +1293,41 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
     lines += ["", "Nota: modello semplice. Infortuni considerati solo per la Premier, "
               "formazioni ufficiali no. Nessuna giocata e' sicura al 100%."]
     return "\n".join(lines)
+
+
+def build_multipla(rows, n_legs=4):
+    """Multipla in stile 'favorita con pagamento anticipato + Gol': una gamba per partita,
+    scelta tra pagamento anticipato e Gol, con probabilita' tra 55% e 88%."""
+    cands = []
+    for m, _s, _b in rows:
+        pr = dict(m["probs"])
+        pr.update(m.get("extra", {}))
+        best = None
+        for k in ("EP1", "EP2", "GG"):
+            p = pr.get(k)
+            if p is None or not (0.55 <= p <= 0.88):
+                continue
+            if best is None or p > best[1]:
+                best = (k, p)
+        if best:
+            cands.append((m, best[0], best[1]))
+    cands.sort(key=lambda c: -c[2])
+    legs = cands[:n_legs]
+    if len(legs) < 2:
+        return None
+    pp, mo = 1.0, 1.0
+    out = []
+    for m, k, p in legs:
+        marg = EXTRA_MARGIN if k.startswith("EP") else MARGIN
+        pp *= p
+        mo *= marg / p
+        out.append({"home": m["home"], "away": m["away"], "league": m["league"],
+                    "time": m["time"], "label": MARKET_LABELS[k], "prob": round(p, 4),
+                    "minodds": round(marg / p, 2)})
+    return {"legs": out, "prob": round(pp, 4), "minodds": round(mo, 2),
+            "note": "Passa circa %d volte su 100. Gioca solo se la quota totale e' almeno %.2f "
+                    "(il bonus multipla del bookmaker conta, ma ogni gamba in piu' aggiunge margine)." % (
+                        round(pp * 100), mo)}
 
 
 def send_ntfy(text):

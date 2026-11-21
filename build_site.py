@@ -105,6 +105,9 @@ border-left:5px solid var(--lo);border-radius:14px;padding:11px 12px;margin-bott
 .mkrow{display:flex;align-items:baseline;gap:8px;padding:5px 0;border-top:1px solid var(--line);font-size:.88rem}
 .mkrow .l{flex:1}.mkrow .p{font-weight:700;min-width:2.8em;text-align:right}.mkrow .q{color:var(--mut);min-width:5.5em;text-align:right}
 .mkrow .d{min-width:3.2em;text-align:right;font-size:.8rem}.d.up{color:var(--hi)}.d.dn{color:var(--bad)}
+.mult{margin-top:14px;border:1px solid var(--line);background:var(--card);border-radius:14px;padding:12px 14px}
+.mleg{display:flex;gap:8px;align-items:baseline;padding:6px 0;border-top:1px solid var(--line);font-size:.9rem}
+.mleg:first-of-type{border-top:0}.mleg .l{flex:1}.mleg .p{font-weight:700}.mleg .q{color:var(--mut);min-width:5.2em;text-align:right}
 .tagm{display:inline-block;margin-top:6px;font-size:.75rem;color:var(--mut);border:1px solid var(--line);border-radius:8px;padding:2px 8px}
 .mkh{font-size:.72rem;color:var(--mut);margin:4px 0}
 .empty{color:var(--mut);font-size:.92rem;padding:8px 2px}
@@ -135,6 +138,7 @@ details.box summary{cursor:pointer;font-weight:600}
   <div id="tiles" class="tiles"></div>
   <section id="top"></section>
   <section id="combos"></section>
+  <section id="multipla" class="mult" style="display:none"></section>
   <h2>Le partite</h2>
   <div id="chips" class="chips"></div>
   <section id="matches"></section>
@@ -278,6 +282,25 @@ function renderTop(v) {
   });
 }
 
+function renderMultipla(v) {
+  const box = $("multipla");
+  if (!box) return;
+  box.textContent = "";
+  const mu = v.multipla;
+  if (!mu) { box.style.display = "none"; return; }
+  box.style.display = "";
+  box.append(el("div", "ptitle", "Multipla in stile (favorite con pagamento anticipato + Gol)"));
+  mu.legs.forEach((g) => {
+    const r = el("div", "mleg");
+    const l = el("div", "l");
+    l.append(el("div", "teams", g.home + " – " + g.away), el("div", "meta", g.label));
+    r.append(l, el("span", "p", pct(g.prob)), el("span", "q", "min " + g.minodds.toFixed(2)));
+    box.append(r);
+  });
+  box.append(el("div", "pick-sub", "Insieme: " + pct(mu.prob) + " · quota totale minima " + mu.minodds.toFixed(2)));
+  box.append(el("div", "note", mu.note));
+}
+
 function renderCombos(v) {
   const box = $("combos");
   box.textContent = "";
@@ -327,7 +350,7 @@ function render(d, flash) {
       sc.textContent = v.scope.label + " · " + v.scope.date + (v.scope.days > 1 ? " (" + v.scope.days + " giorni)" : "");
       sc.classList.remove("hidden");
     } else { sc.classList.add("hidden"); }
-    renderTiles(v); renderTop(v); renderCombos(v); renderChips(v); renderMatches(v);
+    renderTiles(v); renderTop(v); renderCombos(v); renderMultipla(v); renderChips(v); renderMatches(v);
     $("gnotes").textContent = (v.notes || []).join(" ");
   } else {
     $("out").textContent = d.report || "";
