@@ -670,6 +670,28 @@ def market_groups(m):
     return groups
 
 
+def best_picks(groups, n=6):
+    """Le giocate migliori della partita tra tutti i mercati: probabilita' almeno 58%,
+    quota minima almeno 1.15 (sotto non vale la pena), al massimo 2 per famiglia di mercati."""
+    pool = []
+    for g in groups:
+        if g["name"].startswith("Risultati"):
+            continue
+        for it in g["items"]:
+            if it["prob"] >= 0.58 and it["minodds"] >= 1.15:
+                pool.append((g["name"], it))
+    pool.sort(key=lambda x: -x[1]["prob"])
+    per, out = defaultdict(int), []
+    for name, it in pool:
+        if per[name] >= 2:
+            continue
+        per[name] += 1
+        out.append(dict(it, family=name))
+        if len(out) >= n:
+            break
+    return out
+
+
 def load_club_rows(div, today):
     """Storico partite con gol, gialli e tiri in porta (se presenti nel CSV)."""
     out = []
@@ -1279,6 +1301,7 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
                          "mismatch": bool(m.get("mismatch")),
                          "anchored": bool(m.get("anchored")),
                          "markets": market_groups(m),
+                         "best": best_picks(market_groups(m)),
                          "safe": _pick(s, m["odds"], m.get("avg")), "bold": _pick(b, m["odds"], m.get("avg")),
                          "notes": list(m.get("notes", [])), "props": list(m.get("props", []))}
                         for m, s, b in ordered],

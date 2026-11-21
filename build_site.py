@@ -218,6 +218,18 @@ function matchCard(m, open) {
   (m.notes || []).forEach((n) => body.append(el("div", "note", n)));
   body.append(m.safe ? pickBox("Sicura", m.safe) : el("div", "empty", "Partita incerta: nessuna giocata abbastanza solida."));
   if (m.bold) body.append(pickBox("Più quota", m.bold));
+  if (m.best && m.best.length) {
+    const bb = el("div", "mk");
+    bb.append(el("div", "ptitle", "Giocate consigliate (le più probabili)"));
+    m.best.forEach((it) => {
+      const row = el("div", "mkrow");
+      row.append(el("span", "l", it.label));
+      row.append(el("span", "p", pct(it.prob)));
+      row.append(el("span", "q", "min " + it.minodds.toFixed(2)));
+      bb.append(row);
+    });
+    body.append(bb);
+  }
   if (m.anchored) body.append(el("div", "tagm", "Ancorata alle quote di mercato"));
   if (m.markets && m.markets.length) {
     const mk = el("div", "mk");
