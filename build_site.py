@@ -38,7 +38,13 @@ h1{font-size:1.45rem;margin:0;letter-spacing:-.01em}
 h2{font-size:1.02rem;margin:22px 0 8px}
 .actions{display:flex;gap:10px}
 .controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
-.controls #league{grid-column:1/-1}
+.lgs{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px}
+.lg input{position:absolute;opacity:0;pointer-events:none}
+.lg span{display:inline-block;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:99px;padding:7px 13px;font-size:.88rem}
+.lg input:checked+span{background:var(--acc);border-color:var(--acc);color:#fff}
+.mform{margin-top:14px;border:1px solid var(--line);background:var(--card);border-radius:14px;padding:12px 14px}
+.mform .row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}
+.mform select{width:100%}
 .controls input{margin:0;min-width:0}
 .scope{display:inline-block;font-size:.8rem;font-weight:650;color:var(--acc);background:var(--soft);border-radius:99px;padding:4px 11px;margin-top:12px}
 .btn{flex:1;border:0;border-radius:14px;padding:15px 16px;font-size:1.05rem;font-weight:700;color:#fff;
@@ -119,15 +125,15 @@ details.box summary{cursor:pointer;font-weight:600}
 <header><div class="orb">🔮</div><div><h1>L’Oracolo</h1><div class="sub">Consigli sul calcio, calcolati dai dati</div></div></header>
 <div class="actions"><button id="go" class="btn">▶ Chiedi all’Oracolo</button></div>
 <div class="controls">
-  <select id="league" aria-label="Campionato">
-    <option value="tutti">Tutti i campionati</option>
-    <option value="E0">Premier League</option>
-    <option value="SP1">La Liga</option>
-    <option value="D1">Bundesliga</option>
-    <option value="I1">Serie A</option>
-    <option value="F1">Ligue 1</option>
-    <option value="intl">Nazionali</option>
-  </select>
+  <div id="lgs" class="lgs" role="group" aria-label="Campionati">
+    <label class="lg"><input type="checkbox" value="I1"><span>Serie A</span></label>
+    <label class="lg"><input type="checkbox" value="E0"><span>Premier</span></label>
+    <label class="lg"><input type="checkbox" value="SP1"><span>Liga</span></label>
+    <label class="lg"><input type="checkbox" value="D1"><span>Bundesliga</span></label>
+    <label class="lg"><input type="checkbox" value="F1"><span>Ligue 1</span></label>
+    <label class="lg"><input type="checkbox" value="intl"><span>Nazionali</span></label>
+  </div>
+  <div class="hint" style="grid-column:1/-1">Nessuna scelta = tutti i campionati.</div>
   <input id="date" type="date" aria-label="Data da analizzare">
   <select id="days" aria-label="Giorni"><option value="1">1 giorno</option><option value="2">2 giorni</option><option value="3">3 giorni</option><option value="7">1 settimana</option></select>
 </div>
@@ -139,6 +145,16 @@ details.box summary{cursor:pointer;font-weight:600}
   <section id="top"></section>
   <section id="combos"></section>
   <section id="multipla" class="mult" style="display:none"></section>
+  <section id="mform" class="mform">
+    <div class="ptitle">Fammi una multipla</div>
+    <div class="row">
+      <select id="mlegs" aria-label="Gambe"><option value="2">2 gambe</option><option value="3">3 gambe</option><option value="4" selected>4 gambe</option><option value="5">5 gambe</option><option value="6">6 gambe</option></select>
+      <select id="mstyle" aria-label="Stile"><option value="sicura">Sicura</option><option value="bilanciata" selected>Bilanciata</option><option value="rischiosa">Più quota</option></select>
+    </div>
+    <select id="mtype" aria-label="Tipo di giocata"><option value="libero">Qualsiasi giocata</option><option value="gol">Solo gol (Over, Under, Gol, Multigol)</option><option value="anticipato">Solo pagamento anticipato</option><option value="doppia">Solo doppia chance</option></select>
+    <div class="actions"><button id="mgo" class="btn small">Costruisci</button></div>
+    <div id="mout"></div>
+  </section>
   <h2>Le partite</h2>
   <div id="chips" class="chips"></div>
   <section id="matches"></section>
@@ -313,6 +329,55 @@ function renderMultipla(v) {
   box.append(el("div", "note", mu.note));
 }
 
+let lastView = null;
+function buildCustom() {
+  const out = $("mout");
+  out.textContent = "";
+  const v = lastView;
+  if (!v || !v.matches || !v.matches.length) { out.append(el("div", "empty", "Prima lancia un'analisi.")); return; }
+  const n = parseInt($("mlegs").value, 10), style = $("mstyle").value, type = $("mtype").value;
+  const band = style === "sicura" ? [0.72, 0.93] : style === "bilanciata" ? [0.60, 0.72] : [0.45, 0.60];
+  const okType = (g, it) => {
+    if (g.name.indexOf("Risultati") === 0) return false;
+    if (type === "gol") return ["Gol totali", "Gol / No Gol", "Multigol"].indexOf(g.name) >= 0;
+    if (type === "anticipato") return g.name === "Pagamento anticipato";
+    if (type === "doppia") return /^(1X|X2|12) \(/.test(it.label);
+    return true;
+  };
+  const cands = [];
+  v.matches.forEach((m) => {
+    let best = null;
+    (m.markets || []).forEach((g) => g.items.forEach((it) => {
+      if (!okType(g, it) || it.prob < band[0] || it.prob >= band[1] || it.minodds < 1.15) return;
+      if (!best || it.prob > best.it.prob) best = { m, it };
+    }));
+    if (best) cands.push(best);
+  });
+  cands.sort((a, b) => b.it.prob - a.it.prob);
+  const legs = cands.slice(0, n);
+  if (legs.length < 2) {
+    out.append(el("div", "empty", "Non trovo abbastanza partite adatte: prova un altro stile o tipo, oppure analizza più giorni o campionati."));
+    return;
+  }
+  let p = 1, q = 1;
+  legs.forEach((c) => {
+    p *= c.it.prob; q *= c.it.minodds;
+    const r = el("div", "mleg");
+    const l = el("div", "l");
+    l.append(el("div", "teams", c.m.home + " – " + c.m.away), el("div", "meta", c.it.label + (c.m.time ? " · " + c.m.time : "")));
+    r.append(l, el("span", "p", pct(c.it.prob)), el("span", "q", "min " + c.it.minodds.toFixed(2)));
+    out.append(r);
+  });
+  out.append(el("div", "pick-sub", "Insieme: " + pct(p) + " · quota totale minima " + q.toFixed(2)));
+  if (legs.length < n) out.append(el("div", "note", "Ho trovato solo " + legs.length + " gambe adatte su " + n + " richieste."));
+  out.append(el("div", "note", "Gioca solo se la quota totale reale è almeno quella minima. Una multipla perde più spesso di quanto sembri."));
+}
+
+function getLeagues() {
+  const sel = Array.from(document.querySelectorAll("#lgs input:checked")).map((x) => x.value);
+  return sel.length ? sel.join(",") : "tutti";
+}
+
 function renderCombos(v) {
   const box = $("combos");
   box.textContent = "";
@@ -362,7 +427,7 @@ function render(d, flash) {
       sc.textContent = v.scope.label + " · " + v.scope.date + (v.scope.days > 1 ? " (" + v.scope.days + " giorni)" : "");
       sc.classList.remove("hidden");
     } else { sc.classList.add("hidden"); }
-    renderTiles(v); renderTop(v); renderCombos(v); renderMultipla(v); renderChips(v); renderMatches(v);
+    lastView = v; $("mout").textContent = ""; renderTiles(v); renderTop(v); renderCombos(v); renderMultipla(v); renderChips(v); renderMatches(v);
     $("gnotes").textContent = (v.notes || []).join(" ");
   } else {
     $("out").textContent = d.report || "";
@@ -391,7 +456,7 @@ async function run() {
   if (!tok) { $("settings").open = true; setStatus("Prima salva il token nelle Impostazioni."); return; }
   const date = $("date").value || todayStr();
   if (date < todayStr()) { setStatus("Scegli la data di oggi o di un giorno futuro."); return; }
-  try { localStorage.setItem("oracolo_league", $("league").value); } catch (e) {}
+  try { localStorage.setItem("oracolo_league", getLeagues()); } catch (e) {}
   $("go").disabled = true;
   setStatus("Avvio dell’analisi…");
   let before = null;
@@ -401,7 +466,7 @@ async function run() {
       method: "POST",
       headers: { "Accept": "application/vnd.github+json", "Authorization": "Bearer " + tok,
                  "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
-      body: JSON.stringify({ ref: "main", inputs: { days: $("days").value, league: $("league").value, date: date } })
+      body: JSON.stringify({ ref: "main", inputs: { days: $("days").value, league: getLeagues(), date: date } })
     });
     if (r.status !== 204) {
       setStatus(r.status === 401 || r.status === 403 || r.status === 404
@@ -442,7 +507,14 @@ $("clear").addEventListener("click", () => { setToken(""); tokState(); });
 tokState();
 $("date").min = todayStr();
 $("date").value = todayStr();
-try { const l = localStorage.getItem("oracolo_league"); if (l) $("league").value = l; } catch (e) {}
+try {
+  const l = localStorage.getItem("oracolo_league");
+  if (l && l !== "tutti") l.split(",").forEach((c) => {
+    const i = document.querySelector('#lgs input[value="' + c + '"]');
+    if (i) i.checked = true;
+  });
+} catch (e) {}
+$("mgo").addEventListener("click", buildCustom);
 try { render(JSON.parse($("boot").textContent), false); } catch (e) {}
 getLatest().then((d) => render(d, false)).catch(() => {});
 </script>
@@ -501,12 +573,15 @@ def main():
             extra_notes.append("La data scelta e' passata: analizzo oggi.")
     last = start + timedelta(days=max(args.days, 1) - 1)
 
-    lg = (args.league or "tutti").strip()
+    toks = [t.strip() for t in (args.league or "tutti").replace(";", ",").split(",") if t.strip()]
     with_club, with_intl, divs = not args.no_club, not args.no_intl, None
-    if lg.lower() in ("intl", "nazionali"):
-        with_club = False
-    elif lg.upper() in vb.LEAGUES:
-        divs, with_intl = {lg.upper()}, False
+    if toks and "tutti" not in [t.lower() for t in toks]:
+        codes = {t.upper() for t in toks if t.upper() in vb.LEAGUES}
+        want_intl = any(t.lower() in ("intl", "nazionali") for t in toks)
+        if codes or want_intl:
+            divs = codes or None
+            with_club = bool(codes) and not args.no_club
+            with_intl = want_intl and not args.no_intl
 
     sink, view = [], {}
     try:

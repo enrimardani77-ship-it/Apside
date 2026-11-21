@@ -1175,6 +1175,10 @@ def build_report(today, last, with_club, with_intl, with_props=True, sink=None, 
         scope_label = "Nazionali"
     elif with_club and not with_intl and divs and len(divs) == 1:
         scope_label = LEAGUES.get(next(iter(divs)), "Club")
+    elif divs and len(divs) > 1:
+        scope_label = ", ".join(LEAGUES[x] for x in LEAGUES if x in divs) + (" + Nazionali" if with_intl else "")
+    elif divs and with_intl:
+        scope_label = LEAGUES.get(next(iter(divs)), "Club") + " + Nazionali"
     else:
         scope_label = "Tutti i campionati"
     lines = ["L'ORACOLO - consigli del %s" % today.strftime("%d/%m/%Y")]
